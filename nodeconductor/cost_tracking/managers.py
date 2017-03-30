@@ -1,9 +1,12 @@
+import datetime
+
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import MultipleObjectsReturned
-from django.db import models as django_models, IntegrityError
+from django.core.exceptions import ObjectDoesNotExist
+from django.db import models as django_models
 from django.db.models import Q
 from django.utils import timezone
 
+from nodeconductor.core import utils as core_utils
 from nodeconductor.core.managers import GenericKeyMixin
 from nodeconductor.structure.managers import filter_queryset_for_user
 from nodeconductor.structure.models import Service
@@ -16,17 +19,10 @@ class UserFilterMixin(object):
         if queryset is None:
             queryset = self.get_queryset()
 
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             return queryset
 
-        # include orphan estimates with presaved owner
-        try:
-            queryset.model._meta.get_field_by_name('scope_customer')
-        except django_models.FieldDoesNotExist:
-            query = Q()
-        else:
-            query = Q(scope_customer__roles__permission_group__user=user, object_id=None)
-
+        query = Q()
         for model in self.get_available_models():
             user_object_ids = filter_queryset_for_user(model.objects.all(), user).values_list('id', flat=True)
             content_type_id = ContentType.objects.get_for_model(model).id
@@ -47,24 +43,37 @@ class PriceEstimateManager(GenericKeyMixin, UserFilterMixin, django_models.Manag
 
     def get_current(self, scope):
         now = timezone.now()
-        try:
-            return self.get(scope=scope, year=now.year, month=now.month)
-        except MultipleObjectsReturned:
-            return self.get(scope=scope, year=now.year, month=now.month, is_manually_input=True)
+        return self.get(scope=scope, year=now.year, month=now.month)
 
-    def create_or_update(self, scope, **defaults):
-        """
-        We don't use built-in update_or_create method because
-        we need to deal with manually input and auto-generated price estimates.
+    def get_or_create_current(self, scope):
+        now = timezone.now()
+        return self.get_or_create(scope=scope, month=now.month, year=now.year)
 
-        1. If price estimate for current date does not exist yet, we generate it.
-        2. If both auto-generated and manually input price estimates exist, we should update both.
+    def filter_current(self):
+        now = timezone.now()
+        return self.filter(year=now.year, month=now.month)
+
+
+class ConsumptionDetailsQuerySet(django_models.QuerySet):
+
+    def create(self, price_estimate):
+        """ Take configuration from previous month, it it exists.
+            Set last_update_time equals to the beginning of the month.
         """
-        today = timezone.now()
+        kwargs = {}
         try:
-            self.create(scope=scope, year=today.year, month=today.month, is_manually_input=False, **defaults)
-        except IntegrityError:
-            self.filter(scope=scope, year=today.year, month=today.month).update(**defaults)
+            previous_price_estimate = price_estimate.get_previous()
+        except ObjectDoesNotExist:
+            pass
+        else:
+            configuration = previous_price_estimate.consumption_details.configuration
+            kwargs['configuration'] = configuration
+        month_start = core_utils.month_start(datetime.date(price_estimate.year, price_estimate.month, 1))
+        kwargs['last_update_time'] = month_start
+        return super(ConsumptionDetailsQuerySet, self).create(price_estimate=price_estimate, **kwargs)
+
+
+ConsumptionDetailsManager = django_models.Manager.from_queryset(ConsumptionDetailsQuerySet)
 
 
 class PriceListItemManager(GenericKeyMixin, UserFilterMixin, django_models.Manager):
@@ -72,7 +81,3 @@ class PriceListItemManager(GenericKeyMixin, UserFilterMixin, django_models.Manag
     def get_available_models(self):
         """ Return list of models that are acceptable """
         return Service.get_all_models()
-
-
-class ResourcePriceItemManager(GenericKeyMixin, django_models.Manager):
-    pass

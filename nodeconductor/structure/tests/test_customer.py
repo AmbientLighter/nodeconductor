@@ -1,22 +1,17 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
-from unittest import TestCase
-
+from ddt import data, ddt
 from django.core.urlresolvers import reverse
 from django.test import TransactionTestCase
 from mock_django import mock_signal_receiver
 from permission.utils.logics import add_permission_logic, remove_permission_logic
-from rest_framework import status
-from rest_framework import test
+from rest_framework import status, test
 
 from nodeconductor.structure import signals
-from nodeconductor.structure.models import Customer
-from nodeconductor.structure.models import CustomerRole
-from nodeconductor.structure.models import ProjectRole
-from nodeconductor.structure.models import ProjectGroupRole
+from nodeconductor.structure.models import Customer, CustomerRole, ProjectRole
 from nodeconductor.structure.perms import OWNER_CAN_MANAGE_CUSTOMER_LOGICS
-from nodeconductor.structure.tests import factories
+from nodeconductor.structure.tests import factories, fixtures
 
 
 class UrlResolverMixin(object):
@@ -25,9 +20,6 @@ class UrlResolverMixin(object):
 
     def _get_project_url(self, project):
         return 'http://testserver' + reverse('project-detail', kwargs={'uuid': project.uuid})
-
-    def _get_project_group_url(self, project_group):
-        return 'http://testserver' + reverse('projectgroup-detail', kwargs={'uuid': project_group.uuid})
 
     def _get_user_url(self, user):
         return 'http://testserver' + reverse('user-detail', kwargs={'uuid': user.uuid})
@@ -53,7 +45,7 @@ class CustomerTest(TransactionTestCase):
         membership, _ = self.customer.add_user(self.user, CustomerRole.OWNER)
 
         self.assertEqual(membership.user, self.user)
-        self.assertEqual(membership.group.customerrole.customer, self.customer)
+        self.assertEqual(membership.customer, self.customer)
 
     def test_add_user_returns_same_membership_for_consequent_calls_with_same_arguments(self):
         membership1, _ = self.customer.add_user(self.user, CustomerRole.OWNER)
@@ -119,242 +111,89 @@ class CustomerTest(TransactionTestCase):
         self.assertFalse(receiver.called, 'structure_role_remove should not be emitted')
 
 
-class CustomerRoleTest(TestCase):
+class CustomerRoleTest(TransactionTestCase):
     def setUp(self):
         self.customer = factories.CustomerFactory()
 
     def test_get_owners_returns_empty_list(self):
         self.assertEqual(0, self.customer.get_owners().count())
 
-    def test_owner_customer_role_is_created_upon_customer_creation(self):
-        self.assertTrue(self.customer.roles.filter(role_type=CustomerRole.OWNER).exists(),
-                        'Owner role should have been created')
 
-
+@ddt
 class CustomerApiPermissionTest(UrlResolverMixin, test.APITransactionTestCase):
     def setUp(self):
-        self.users = {
-            'staff': factories.UserFactory(is_staff=True),
-            'owner': factories.UserFactory(),
-            'not_owner': factories.UserFactory(),
-            'admin': factories.UserFactory(),
-            'admin_other': factories.UserFactory(),
-            'manager': factories.UserFactory(),
-            'group_manager': factories.UserFactory(),
-        }
-
-        self.customers = {
-            'owned': factories.CustomerFactory.create_batch(2),
-            'inaccessible': factories.CustomerFactory.create_batch(2),
-            'admin': factories.CustomerFactory(),
-            'manager': factories.CustomerFactory(),
-            'group_manager': factories.CustomerFactory(),
-        }
-
-        for customer in self.customers['owned']:
-            customer.add_user(self.users['owner'], CustomerRole.OWNER)
-
-        self.projects = {
-            'admin': factories.ProjectFactory(customer=self.customers['admin']),
-            'manager': factories.ProjectFactory(customer=self.customers['manager']),
-            'group_manager': factories.ProjectFactory(customer=self.customers['group_manager']),
-        }
-
-        self.projects['admin'].add_user(self.users['admin'], ProjectRole.ADMINISTRATOR)
-        self.projects['manager'].add_user(self.users['manager'], ProjectRole.MANAGER)
-
-        self.project_groups = {
-            'admin': factories.ProjectGroupFactory(customer=self.customers['admin']),
-            'manager': factories.ProjectGroupFactory(customer=self.customers['manager']),
-            'group_manager': factories.ProjectGroupFactory(customer=self.customers['group_manager']),
-        }
-
-        self.project_groups['admin'].projects.add(self.projects['admin'])
-        self.project_groups['manager'].projects.add(self.projects['manager'])
-        self.project_groups['group_manager'].projects.add(self.projects['group_manager'])
-        self.project_groups['group_manager'].add_user(self.users['group_manager'], ProjectGroupRole.MANAGER)
+        self.fixture = fixtures.ProjectFixture()
 
     # List filtration tests
-    def test_user_can_list_customers_he_is_owner_of(self):
-        self.client.force_authenticate(user=self.users['owner'])
+    @data('staff', 'global_support', 'owner', 'customer_support', 'admin', 'manager', 'project_support')
+    def test_user_can_list_customers(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
 
-        self._check_user_list_access_customers(self.customers['owned'], 'assertIn')
+        self._check_user_list_access_customers(self.fixture.customer, 'assertIn')
 
-    def test_user_cannot_list_customers_he_is_not_owner_of(self):
-        self.client.force_authenticate(user=self.users['not_owner'])
-
-        self._check_user_list_access_customers(self.customers['inaccessible'], 'assertNotIn')
-
-    def test_user_can_list_customers_if_he_is_staff(self):
-        self.client.force_authenticate(user=self.users['staff'])
-
-        self._check_user_list_access_customers(self.customers['owned'], 'assertIn')
-
-        self._check_user_list_access_customers(self.customers['inaccessible'], 'assertIn')
-
-    def test_user_can_list_customer_if_he_is_admin_in_a_project_owned_by_a_customer(self):
-        self.client.force_authenticate(user=self.users['admin'])
-        self._check_customer_in_list(self.customers['admin'])
-
-    def test_user_can_list_customer_if_he_is_manager_in_a_project_owned_by_a_customer(self):
-        self.client.force_authenticate(user=self.users['manager'])
-        self._check_customer_in_list(self.customers['manager'])
-
-    def test_user_can_list_customer_if_he_is_group_manager_in_a_project_group_owned_by_a_customer(self):
-        self.client.force_authenticate(user=self.users['group_manager'])
-        self._check_customer_in_list(self.customers['group_manager'])
-
-    def test_user_cannot_list_customer_if_he_is_admin_in_a_project_not_owned_by_a_customer(self):
-        self.client.force_authenticate(user=self.users['admin'])
-        self._check_customer_in_list(self.customers['manager'], False)
-
-    def test_user_cannot_list_customer_if_he_is_manager_in_a_project_not_owned_by_a_customer(self):
-        self.client.force_authenticate(user=self.users['manager'])
-        self._check_customer_in_list(self.customers['admin'], False)
-
-    def test_user_cannot_list_customer_if_he_is_group_manager_in_a_project_group_not_owned_by_a_customer(self):
-        self.client.force_authenticate(user=self.users['group_manager'])
-        self._check_customer_in_list(self.customers['manager'], False)
+    @data('user', 'admin', 'manager', 'project_support')
+    def test_user_cannot_list_other_customer(self, user):
+        customer = factories.CustomerFactory()
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        self._check_customer_in_list(customer, False)
 
     # Nested objects filtration tests
-    def test_user_can_see_project_he_has_a_role_in_within_customer(self):
-        for user_role in ('admin', 'manager', 'group_manager'):
-            self.client.force_authenticate(user=self.users[user_role])
+    @data('admin', 'manager', 'project_support')
+    def test_user_can_see_project_he_has_a_role_in_within_customer(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
 
-            customer = self.customers[user_role]
-
-            seen_project = self.projects[user_role]
-
-            response = self.client.get(self._get_customer_url(customer))
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-            project_urls = set([project['url'] for project in response.data['projects']])
-            self.assertIn(
-                self._get_project_url(seen_project), project_urls,
-                'User should see project',
-            )
-
-    def test_user_can_see_project_group_he_has_a_role_in_within_customer(self):
-        for user_role in ('admin', 'manager', 'group_manager'):
-            self.client.force_authenticate(user=self.users[user_role])
-
-            customer = self.customers[user_role]
-
-            seen_project_group = self.project_groups[user_role]
-
-            response = self.client.get(self._get_customer_url(customer))
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-            project_group_urls = set([pgrp['url'] for pgrp in response.data['project_groups']])
-            self.assertIn(
-                self._get_project_group_url(seen_project_group), project_group_urls,
-                'User should see project group',
-            )
-
-    def test_user_cannot_see_project_groups_from_different_customer(self):
-        # setUp
-        project_group_1_1 = self.project_groups['admin']
-        project_group_1_2 = factories.ProjectGroupFactory(customer=self.customers['admin'])
-
-        project_group_2_1 = self.project_groups['manager']
-        project_group_2_2 = factories.ProjectGroupFactory(customer=self.customers['manager'])
-
-        self.projects['manager'].add_user(self.users['admin'], ProjectRole.MANAGER)
-
-        # test body
-        self.client.force_authenticate(user=self.users['admin'])
-        response = self.client.get(self._get_customer_url(self.customers['admin']))
+        response = self.client.get(self._get_customer_url(self.fixture.customer))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        project_group_urls = set([project_group['url'] for project_group in response.data['project_groups']])
-
+        project_urls = set([project['url'] for project in response.data['projects']])
         self.assertIn(
-            self._get_project_group_url(project_group_1_1), project_group_urls,
-            'User should see project group {0}'.format(project_group_1_1),
+            self._get_project_url(self.fixture.project), project_urls,
+            'User should see project',
         )
 
-        for project_group in (
-                project_group_1_2,
-                project_group_2_1,
-                project_group_2_2,
-        ):
-            self.assertNotIn(
-                self._get_project_group_url(project_group), project_group_urls,
-                'User should not see project group {0}'.format(project_group),
-            )
+    @data('admin', 'manager', 'project_support')
+    def test_user_cannot_see_project_he_has_no_role_in_within_customer(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
 
-    def test_user_cannot_see_project_he_has_no_role_in_within_customer(self):
-        for user_role in ('admin', 'manager', 'group_manager'):
-            self.client.force_authenticate(user=self.users[user_role])
+        non_seen_project = factories.ProjectFactory(customer=self.fixture.customer)
 
-            customer = self.customers[user_role]
+        response = self.client.get(self._get_customer_url(self.fixture.customer))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-            non_seen_project = factories.ProjectFactory(customer=customer)
-
-            response = self.client.get(self._get_customer_url(customer))
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-            project_urls = set([project['url'] for project in response.data['projects']])
-            self.assertNotIn(
-                self._get_project_url(non_seen_project), project_urls,
-                'User should not see project',
-            )
-
-    def test_user_cannot_see_project_group_he_has_no_role_in_within_customer(self):
-        for user_role in ('admin', 'manager', 'group_manager'):
-            self.client.force_authenticate(user=self.users[user_role])
-
-            customer = self.customers[user_role]
-
-            non_seen_project = factories.ProjectFactory(customer=customer)
-            non_seen_project_group = factories.ProjectGroupFactory(customer=customer)
-            non_seen_project_group.projects.add(non_seen_project)
-
-            response = self.client.get(self._get_customer_url(customer))
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-            project_group_urls = set([pgrp['url'] for pgrp in response.data['project_groups']])
-            self.assertNotIn(
-                self._get_project_group_url(non_seen_project_group), project_group_urls,
-                'User should not see project group',
-            )
+        project_urls = set([project['url'] for project in response.data['projects']])
+        self.assertNotIn(
+            self._get_project_url(non_seen_project), project_urls,
+            'User should not see project',
+        )
 
     # Direct instance access tests
-    def test_user_can_access_customers_he_is_owner_of(self):
-        self.client.force_authenticate(user=self.users['owner'])
+    @data(('owner', 'owners'), ('customer_support', 'support_users'))
+    def test_user_can_see_its_owner_membership_in_a_service_he_is_owner_of(self, user_data):
+        user, response_field = user_data
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self._get_customer_url(self.fixture.customer))
+        users = set(c['url'] for c in response.data[response_field])
 
-        self._check_user_direct_access_customer(self.customers['owned'], status.HTTP_200_OK)
+        user_url = self._get_user_url(getattr(self.fixture, user))
+        self.assertItemsEqual([user_url], users)
 
-    def test_user_can_see_its_owner_membership_in_a_service_he_is_owner_of(self):
-        self.client.force_authenticate(user=self.users['owner'])
-        for customer in self.customers['owned']:
-            response = self.client.get(self._get_customer_url(customer))
-            owners = set(c['url'] for c in response.data['owners'])
-            user_url = self._get_user_url(self.users['owner'])
-            self.assertItemsEqual([user_url], owners)
+    @data('staff', 'global_support')
+    def test_user_can_access_all_customers_if_he_is_staff(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
 
-    def test_user_cannot_access_customers_he_is_not_owner_of(self):
-        self.client.force_authenticate(user=self.users['not_owner'])
-        # 404 is used instead of 403 to hide the fact that the resource exists at all
-        self._check_user_direct_access_customer(self.customers['inaccessible'], status.HTTP_404_NOT_FOUND)
+        self._check_user_direct_access_customer(self.fixture.customer, status.HTTP_200_OK)
 
-    def test_user_can_access_all_customers_if_he_is_staff(self):
-        self.client.force_authenticate(user=self.users['staff'])
-
-        self._check_user_direct_access_customer(self.customers['owned'], status.HTTP_200_OK)
-
-        self._check_user_direct_access_customer(self.customers['inaccessible'], status.HTTP_200_OK)
+        customer = factories.CustomerFactory()
+        self._check_user_direct_access_customer(customer, status.HTTP_200_OK)
 
     # Helper methods
-    def _check_user_list_access_customers(self, customers, test_function):
+    def _check_user_list_access_customers(self, customer, test_function):
         response = self.client.get(reverse('customer-list'))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         urls = set([instance['url'] for instance in response.data])
-        for customer in customers:
-            url = self._get_customer_url(customer)
-
-            getattr(self, test_function)(url, urls)
+        url = self._get_customer_url(customer)
+        getattr(self, test_function)(url, urls)
 
     def _check_customer_in_list(self, customer, positive=True):
         response = self.client.get(reverse('customer-list'))
@@ -367,147 +206,98 @@ class CustomerApiPermissionTest(UrlResolverMixin, test.APITransactionTestCase):
         else:
             self.assertNotIn(customer_url, urls)
 
-    def _check_user_direct_access_customer(self, customers, status_code):
-        for customer in customers:
-            response = self.client.get(self._get_customer_url(customer))
-
-            self.assertEqual(response.status_code, status_code)
+    def _check_user_direct_access_customer(self, customer, status_code):
+        response = self.client.get(self._get_customer_url(customer))
+        self.assertEqual(response.status_code, status_code)
 
 
-class CustomerApiManipulationTest(UrlResolverMixin, test.APISimpleTestCase):
+@ddt
+class CustomerApiManipulationTest(UrlResolverMixin, test.APITransactionTestCase):
     def setUp(self):
-        self.users = {
-            'staff': factories.UserFactory(is_staff=True),
-            'owner': factories.UserFactory(),
-            'not_owner': factories.UserFactory(),
-        }
-
-        self.customers = {
-            'owner': factories.CustomerFactory(),
-            'inaccessible': factories.CustomerFactory(),
-        }
-
-        self.customers['owner'].add_user(self.users['owner'], CustomerRole.OWNER)
+        self.fixture = fixtures.ProjectFixture()
 
     # Deletion tests
-    def test_user_cannot_delete_customer_he_is_not_owner_of(self):
-        self.client.force_authenticate(user=self.users['not_owner'])
+    @data('owner', 'admin', 'manager', 'global_support', 'customer_support', 'project_support')
+    def test_user_cannot_delete_customer(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
 
-        response = self.client.delete(self._get_customer_url(self.customers['inaccessible']))
-
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-
-    def test_user_cannot_delete_customer_he_is_owner_of(self):
-        self.client.force_authenticate(user=self.users['owner'])
-
-        response = self.client.delete(self._get_customer_url(self.customers['owner']))
-
+        response = self.client.delete(self._get_customer_url(self.fixture.customer))
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_user_can_delete_customer_without_associated_project_groups_and_projects_if_he_is_staff(self):
-        self.client.force_authenticate(user=self.users['staff'])
-
-        response = self.client.delete(self._get_customer_url(self.customers['owner']))
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-
-        response = self.client.delete(self._get_customer_url(self.customers['inaccessible']))
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-
-    def test_user_cannot_delete_customer_with_associated_project_groups_if_he_is_staff(self):
-        self.client.force_authenticate(user=self.users['staff'])
-
-        for customer in self.customers.values():
-            factories.ProjectGroupFactory(customer=customer)
-
-            response = self.client.delete(self._get_customer_url(customer))
-
-            self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-            self.assertDictContainsSubset({'detail': 'Cannot delete customer with existing project groups'},
-                                          response.data)
-
     def test_user_cannot_delete_customer_with_associated_projects_if_he_is_staff(self):
-        self.client.force_authenticate(user=self.users['staff'])
+        self.client.force_authenticate(user=self.fixture.staff)
 
-        for customer in self.customers.values():
-            factories.ProjectFactory(customer=customer)
+        factories.ProjectFactory(customer=self.fixture.customer)
+        response = self.client.delete(self._get_customer_url(self.fixture.customer))
 
-            response = self.client.delete(self._get_customer_url(customer))
-
-            self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-            self.assertDictContainsSubset({'detail': 'Cannot delete customer with existing projects'},
-                                          response.data)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertDictContainsSubset({'detail': 'Cannot delete organization with existing projects'},
+                                      response.data)
 
     # Creation tests
-    def test_user_can_not_create_customer_if_he_is_not_staff(self):
-        self.client.force_authenticate(user=self.users['not_owner'])
+    @data('user', 'global_support')
+    def test_user_can_not_create_customer_if_he_is_not_staff(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
 
-        response = self.client.post(reverse('customer-list'), self._get_valid_payload())
-
+        response = self.client.post(factories.CustomerFactory.get_list_url(), self._get_valid_payload())
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_user_can_create_customer_if_he_is_not_staff_if_settings_are_tweaked(self):
         add_permission_logic(Customer, OWNER_CAN_MANAGE_CUSTOMER_LOGICS)
-        self.client.force_authenticate(user=self.users['not_owner'])
-
-        response = self.client.post(reverse('customer-list'), self._get_valid_payload())
+        self.client.force_authenticate(user=self.fixture.user)
+        response = self.client.post(factories.CustomerFactory.get_list_url(), self._get_valid_payload())
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
         # User became owner of created customer
-        self.assertEqual(response.data['owners'][0]['uuid'], self.users['not_owner'].uuid.hex)
+        self.assertEqual(response.data['owners'][0]['uuid'], self.fixture.user.uuid.hex)
         remove_permission_logic(Customer, OWNER_CAN_MANAGE_CUSTOMER_LOGICS)
 
     def test_user_can_create_customer_if_he_is_staff(self):
-        self.client.force_authenticate(user=self.users['staff'])
+        self.client.force_authenticate(user=self.fixture.staff)
 
-        response = self.client.post(reverse('customer-list'), self._get_valid_payload())
+        response = self.client.post(factories.CustomerFactory.get_list_url(), self._get_valid_payload())
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
     # Mutation tests
-    def test_user_cannot_change_customer_as_whole_he_is_not_owner_of(self):
-        self.client.force_authenticate(user=self.users['not_owner'])
+    @data('manager', 'admin', 'customer_support', 'project_support', 'global_support')
+    def test_user_cannot_change_customer_as_whole(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
 
-        response = self.client.put(self._get_customer_url(self.customers['inaccessible']),
+        response = self.client.put(self._get_customer_url(self.fixture.customer),
                                    self._get_valid_payload())
 
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_user_cannot_change_customer_he_is_owner_of(self):
-        self.client.force_authenticate(user=self.users['owner'])
+        self.client.force_authenticate(user=self.fixture.owner)
 
-        response = self.client.put(self._get_customer_url(self.customers['owner']),
+        response = self.client.put(self._get_customer_url(self.fixture.customer),
                                    self._get_valid_payload())
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_user_can_change_customer_as_whole_if_he_is_staff(self):
-        self.client.force_authenticate(user=self.users['staff'])
+        self.client.force_authenticate(user=self.fixture.staff)
 
-        response = self.client.put(self._get_customer_url(self.customers['owner']),
+        response = self.client.put(self._get_customer_url(self.fixture.customer),
                                    self._get_valid_payload())
         self.assertEqual(response.status_code, status.HTTP_200_OK, 'Error message: %s' % response.data)
 
-        response = self.client.put(self._get_customer_url(self.customers['inaccessible']),
-                                   self._get_valid_payload())
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
     def test_user_cannot_change_single_customer_field_he_is_not_owner_of(self):
-        self.client.force_authenticate(user=self.users['not_owner'])
+        self.client.force_authenticate(user=self.fixture.user)
 
-        self._check_single_customer_field_change_permission(self.customers['inaccessible'], status.HTTP_404_NOT_FOUND)
+        self._check_single_customer_field_change_permission(self.fixture.customer, status.HTTP_404_NOT_FOUND)
 
     def test_user_cannot_change_customer_field_he_is_owner_of(self):
-        self.client.force_authenticate(user=self.users['owner'])
+        self.client.force_authenticate(user=self.fixture.owner)
 
-        self._check_single_customer_field_change_permission(self.customers['owner'], status.HTTP_403_FORBIDDEN)
+        self._check_single_customer_field_change_permission(self.fixture.customer, status.HTTP_403_FORBIDDEN)
 
     def test_user_can_change_single_customer_field_if_he_is_staff(self):
-        self.client.force_authenticate(user=self.users['staff'])
-
-        self._check_single_customer_field_change_permission(self.customers['owner'], status.HTTP_200_OK)
-
-        self._check_single_customer_field_change_permission(self.customers['inaccessible'], status.HTTP_200_OK)
+        self.client.force_authenticate(user=self.fixture.staff)
+        self._check_single_customer_field_change_permission(self.fixture.customer, status.HTTP_200_OK)
 
     # Helper methods
     def _get_valid_payload(self, resource=None):
@@ -529,27 +319,6 @@ class CustomerApiManipulationTest(UrlResolverMixin, test.APISimpleTestCase):
 
             response = self.client.patch(self._get_customer_url(customer), data)
             self.assertEqual(response.status_code, status_code)
-
-
-class CustomerListTest(test.APITransactionTestCase):
-
-    def setUp(self):
-        self.customer = factories.CustomerFactory()
-        self.project_group = factories.ProjectGroupFactory(customer=self.customer)
-        self.staff = factories.UserFactory(is_staff=True)
-
-    def get_list_response(self, user):
-        self.client.force_authenticate(user)
-        return self.client.get(factories.CustomerFactory.get_list_url())
-
-    def test_customer_list_returns_project_group_uuids(self):
-        # when
-        response = self.get_list_response(self.staff)
-        # then
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(
-            response.data[0]['project_groups'][0]['uuid'], self.project_group.uuid.hex,
-            'Customer list response should contain related project groups uuid')
 
 
 class CustomerQuotasTest(test.APITransactionTestCase):
@@ -622,19 +391,6 @@ class CustomerQuotasTest(test.APITransactionTestCase):
         project.remove_user(user)
         self.assert_quota_usage('nc_user_count', 0)
 
-    def test_customer_users_quota_increases_on_adding_manager(self):
-        project_group = factories.ProjectGroupFactory(customer=self.customer)
-        user = factories.UserFactory()
-        project_group.add_user(user, ProjectGroupRole.MANAGER)
-        self.assert_quota_usage('nc_user_count', 1)
-
-    def test_customer_users_quota_decreases_on_removing_manager(self):
-        project_group = factories.ProjectGroupFactory(customer=self.customer)
-        user = factories.UserFactory()
-        project_group.add_user(user, ProjectGroupRole.MANAGER)
-        project_group.remove_user(user)
-        self.assert_quota_usage('nc_user_count', 0)
-
     def test_customer_quota_is_not_increased_on_adding_owner_as_administrator(self):
         user = factories.UserFactory()
         project = factories.ProjectFactory(customer=self.customer)
@@ -680,3 +436,103 @@ class CustomerQuotasTest(test.APITransactionTestCase):
 class CustomerUnicodeTest(TransactionTestCase):
     def test_customer_can_have_unicode_name(self):
         factories.CustomerFactory(name="Моя организация")
+
+
+@ddt
+class CustomerUsersListTest(test.APITransactionTestCase):
+    all_users = ('staff', 'owner', 'manager', 'admin', 'customer_support', 'project_support', 'global_support')
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.url = factories.CustomerFactory.get_url(self.fixture.customer, action='users')
+
+    @data(*all_users)
+    def test_user_can_list_customer_users(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        # call fixture to initiate all users:
+        for user in self.all_users:
+            getattr(self.fixture, user)
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 5)
+
+        self.assertSetEqual({user['role'] for user in response.data}, {'owner', 'support', None, None})
+        self.assertSetEqual({user['uuid'] for user in response.data},
+                            {self.fixture.owner.uuid.hex, self.fixture.admin.uuid.hex, self.fixture.manager.uuid.hex,
+                             self.fixture.customer_support.uuid.hex, self.fixture.project_support.uuid.hex})
+        self.assertSetEqual({user['projects'] and user['projects'][0]['role'] or None
+                             for user in response.data}, {None, 'admin', 'manager', 'support'})
+
+    def test_user_can_not_list_project_users(self):
+        self.client.force_authenticate(self.fixture.user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_users_ordering_by_concatenated_name(self):
+        walter = factories.UserFactory(full_name='', username='walter')
+        admin = factories.UserFactory(full_name='admin', username='zzz')
+        alice = factories.UserFactory(full_name='', username='alice')
+        dave = factories.UserFactory(full_name='dave', username='dave')
+        expected_order = [admin, alice, dave, walter]
+        for user in expected_order:
+            self.fixture.customer.add_user(user, CustomerRole.OWNER)
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url + '?o=concatenated_name')
+        for serialized_user, expected_user in zip(response.data, expected_order):
+            self.assertEqual(serialized_user['uuid'], expected_user.uuid.hex)
+
+        # reversed order
+        response = self.client.get(self.url + '?o=-concatenated_name')
+        for serialized_user, expected_user in zip(response.data, expected_order[::-1]):
+            self.assertEqual(serialized_user['uuid'], expected_user.uuid.hex)
+
+
+@ddt
+class CustomerCountersListTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ServiceFixture()
+        self.owner = self.fixture.owner
+        self.customer_support = self.fixture.customer_support
+        self.admin = self.fixture.admin
+        self.manager = self.fixture.manager
+        self.project_support = self.fixture.project_support
+        self.customer = self.fixture.customer
+        self.service = self.fixture.service
+        self.url = factories.CustomerFactory.get_url(self.customer, action='counters')
+
+    @data('owner', 'customer_support')
+    def test_user_can_get_customer_counters(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.get(self.url, {'fields': ['users', 'projects', 'services']})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {'users': 5, 'projects': 1, 'services': 1})
+
+
+class UserCustomersFilterTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.staff = factories.UserFactory(is_staff=True)
+        self.user1 = factories.UserFactory()
+        self.user2 = factories.UserFactory()
+
+        self.customer1 = factories.CustomerFactory()
+        self.customer2 = factories.CustomerFactory()
+
+        self.customer1.add_user(self.user1, CustomerRole.OWNER)
+        self.customer2.add_user(self.user1, CustomerRole.OWNER)
+        self.customer2.add_user(self.user2, CustomerRole.OWNER)
+
+    def test_staff_can_filter_customer_by_user(self):
+        self.assert_staff_can_filter_customer_by_user(self.user1, {self.customer1, self.customer2})
+        self.assert_staff_can_filter_customer_by_user(self.user2, {self.customer2})
+
+    def assert_staff_can_filter_customer_by_user(self, user, customers):
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(factories.CustomerFactory.get_list_url(), {
+            'user_uuid': user.uuid.hex,
+            'fields': ['uuid']
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual({customer['uuid'] for customer in response.data},
+                         {customer.uuid.hex for customer in customers})

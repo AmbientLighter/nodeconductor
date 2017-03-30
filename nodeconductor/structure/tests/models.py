@@ -1,5 +1,6 @@
 from django.db import models
 
+from nodeconductor.core import models as core_models
 from nodeconductor.quotas.fields import QuotaField
 from nodeconductor.quotas.models import QuotaModelMixin
 from nodeconductor.structure import models as structure_models
@@ -30,12 +31,26 @@ class TestServiceProjectLink(structure_models.ServiceProjectLink):
         return 'test-spl'
 
 
-class TestInstance(structure_models.VirtualMachineMixin,
-                   structure_models.PaidResource,
-                   structure_models.Resource):
+class TestNewInstance(core_models.RuntimeStateMixin,
+                      core_models.StateMixin,
+                      QuotaModelMixin,
+                      structure_models.VirtualMachineMixin,
+                      structure_models.ResourceMixin):
 
     service_project_link = models.ForeignKey(TestServiceProjectLink, on_delete=models.PROTECT)
+    flavor_name = models.CharField(max_length=255, blank=True)
+
+    class Quotas(QuotaModelMixin.Quotas):
+        test_quota = QuotaField(default_limit=1)
 
     @classmethod
     def get_url_name(cls):
-        return 'test-instances'
+        return 'test-new-instances'
+
+    @property
+    def internal_ips(self):
+        return ['127.0.0.1']
+
+    @property
+    def external_ips(self):
+        return ['8.8.8.8']

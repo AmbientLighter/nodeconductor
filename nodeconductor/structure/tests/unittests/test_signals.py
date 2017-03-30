@@ -1,32 +1,7 @@
 from django.test import TestCase
 
-from nodeconductor.structure import models
 from nodeconductor.structure.tests import factories
 from nodeconductor.structure.tests import models as test_models
-
-
-class ProjectSignalsTest(TestCase):
-
-    def setUp(self):
-        self.project = factories.ProjectFactory()
-
-    def test_admin_project_role_is_created_upon_project_creation(self):
-        self.assertTrue(self.project.roles.filter(role_type=models.ProjectRole.ADMINISTRATOR).exists(),
-                        'Administrator role should have been created')
-
-    def test_manager_project_role_is_created_upon_project_creation(self):
-        self.assertTrue(self.project.roles.filter(role_type=models.ProjectRole.MANAGER).exists(),
-                        'Manager role should have been created')
-
-
-class ProjectGroupSignalsTest(TestCase):
-
-    def setUp(self):
-        self.project_group = factories.ProjectGroupFactory()
-
-    def test_group_manager_role_is_created_upon_project_group_creation(self):
-        self.assertTrue(self.project_group.roles.filter(role_type=models.ProjectGroupRole.MANAGER).exists(),
-                        'Group manager role should have been created')
 
 
 class ServiceSettingsSignalsTest(TestCase):
@@ -75,8 +50,7 @@ class ServiceProjectLinkSignalsTest(TestCase):
 
     def create_service(self, customer, available_for_all):
         service_settings = factories.ServiceSettingsFactory(shared=False)
-        return test_models.TestService.objects.create(name='test',
-                                                      customer=customer,
+        return test_models.TestService.objects.create(customer=customer,
                                                       settings=service_settings,
                                                       available_for_all=available_for_all)
 

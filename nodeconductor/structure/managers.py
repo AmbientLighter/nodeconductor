@@ -6,9 +6,9 @@ from nodeconductor.core.managers import GenericKeyMixin, SummaryQuerySet
 
 
 def filter_queryset_for_user(queryset, user):
-    filtered_relations = ('customer', 'project', 'project_group')
+    filtered_relations = ('customer', 'project')
 
-    if user is None or user.is_staff:
+    if user is None or user.is_staff or user.is_support:
         return queryset
 
     def create_q(entity):
@@ -25,11 +25,12 @@ def filter_queryset_for_user(queryset, user):
             prefix = path + '__'
 
         kwargs = {
-            prefix + 'roles__permission_group__user': user,
+            prefix + 'permissions__user': user,
+            prefix + 'permissions__is_active': True
         }
 
         if role:
-            kwargs[prefix + 'roles__role_type'] = role
+            kwargs[prefix + 'permissions__role'] = role
 
         return models.Q(**kwargs)
 
@@ -105,7 +106,7 @@ class StructureQueryset(models.QuerySet):
     def _filter_by_custom_fields(self, **kwargs):
         # traverse over filter arguments in search of custom fields
         args = {}
-        fields = self.model._meta.get_all_field_names()
+        fields = [f.name for f in self.model._meta.get_fields()]
         for field, val in kwargs.items():
             base_field = field.split('__')[0]
             if base_field in fields:

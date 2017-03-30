@@ -3,22 +3,21 @@ from __future__ import unicode_literals
 import json
 import logging
 
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 
 import pyvat
 from django.conf import settings
 from django.contrib import auth
+import django.core.exceptions as django_exceptions
 from django.core.validators import RegexValidator, MaxLengthValidator
-from django.core.urlresolvers import NoReverseMatch
 from django.db import models as django_models, transaction
-from django.utils import six
+from django.utils import six, timezone
 from django.utils.functional import cached_property
+from django.utils.translation import ugettext_lazy as _
 from rest_framework import exceptions, serializers
 from rest_framework.reverse import reverse
 
-from nodeconductor.core import models as core_models
-from nodeconductor.core import serializers as core_serializers
-from nodeconductor.core import utils as core_utils
+from nodeconductor.core import (models as core_models, serializers as core_serializers, utils as core_utils)
 from nodeconductor.core.fields import MappedChoiceField
 from nodeconductor.monitoring.serializers import MonitoringSerializerMixin
 from nodeconductor.quotas import serializers as quotas_serializers
@@ -32,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 class IpCountValidator(MaxLengthValidator):
-    message = 'Only %(limit_value)s ip address is supported.'
+    message = _('Only %(limit_value)s ip address is supported.')
 
 
 class PermissionFieldFilteringMixin(object):
@@ -49,6 +48,7 @@ class PermissionFieldFilteringMixin(object):
        in the class that this mixin is mixed into and return
        the field in question from that method.
     """
+
     def get_fields(self):
         fields = super(PermissionFieldFilteringMixin, self).get_fields()
 
@@ -79,12 +79,12 @@ class PermissionListSerializer(serializers.ListSerializer):
 
     In order to use it set Meta.list_serializer_class. Example:
 
-    >>> class PermissionProjectGroupSerializer(BasicProjectGroupSerializer):
-    >>>     class Meta(BasicProjectGroupSerializer.Meta):
+    >>> class PermissionProjectSerializer(BasicProjectSerializer):
+    >>>     class Meta(BasicProjectSerializer.Meta):
     >>>         list_serializer_class = PermissionListSerializer
     >>>
     >>> class CustomerSerializer(serializers.HyperlinkedModelSerializer):
-    >>>     project_groups = PermissionProjectGroupSerializer(many=True, read_only=True)
+    >>>     projects = PermissionProjectSerializer(many=True, read_only=True)
     """
     def to_representation(self, data):
         try:
@@ -111,7 +111,6 @@ class BasicUserSerializer(serializers.HyperlinkedModelSerializer):
 class BasicProjectSerializer(core_serializers.BasicInfoSerializer):
     class Meta(core_serializers.BasicInfoSerializer.Meta):
         model = models.Project
-        fields = ('url', 'uuid', 'name')
 
 
 class PermissionProjectSerializer(BasicProjectSerializer):
@@ -119,38 +118,22 @@ class PermissionProjectSerializer(BasicProjectSerializer):
         list_serializer_class = PermissionListSerializer
 
 
-class BasicProjectGroupSerializer(core_serializers.BasicInfoSerializer):
-    class Meta(core_serializers.BasicInfoSerializer.Meta):
-        model = models.ProjectGroup
-        fields = ('url', 'name', 'uuid')
-        read_only_fields = ('name', 'uuid')
-
-
-class PermissionProjectGroupSerializer(BasicProjectGroupSerializer):
-    class Meta(BasicProjectGroupSerializer.Meta):
-        list_serializer_class = PermissionListSerializer
-
-
-class NestedProjectGroupSerializer(core_serializers.HyperlinkedRelatedModelSerializer):
-    class Meta(object):
-        model = models.ProjectGroup
-        fields = ('url', 'name', 'uuid')
-        read_only_fields = ('name', 'uuid')
-        extra_kwargs = {
-            'url': {'lookup_field': 'uuid'},
-        }
-
-
 class NestedServiceProjectLinkSerializer(serializers.Serializer):
     uuid = serializers.ReadOnlyField(source='service.uuid')
     url = serializers.SerializerMethodField()
     service_project_link_url = serializers.SerializerMethodField()
-    name = serializers.ReadOnlyField(source='service.name')
+    name = serializers.ReadOnlyField(source='service.settings.name')
     type = serializers.SerializerMethodField()
     state = serializers.SerializerMethodField()
     shared = serializers.SerializerMethodField()
     settings_uuid = serializers.ReadOnlyField(source='service.settings.uuid')
     settings = serializers.SerializerMethodField()
+    validation_state = serializers.ChoiceField(
+        choices=models.ServiceProjectLink.States.CHOICES,
+        read_only=True,
+        help_text=_('A state of service compliance with project requirements.'))
+    validation_message = serializers.ReadOnlyField(
+        help_text=_('An error message for a service that is non-compliant with project requirements.'))
 
     def get_settings(self, link):
         """
@@ -193,19 +176,26 @@ class NestedServiceProjectLinkSerializer(serializers.Serializer):
         return link.service.settings.shared
 
 
+class NestedServiceCertificationSerializer(core_serializers.AugmentedSerializerMixin,
+                                           core_serializers.HyperlinkedRelatedModelSerializer):
+    class Meta(object):
+        model = models.ServiceCertification
+        fields = ('uuid', 'url', 'name', 'description', 'link')
+        read_only_fields = ('name', 'description', 'link')
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid'},
+        }
+
+
 class ProjectSerializer(core_serializers.RestrictedSerializerMixin,
                         PermissionFieldFilteringMixin,
                         core_serializers.AugmentedSerializerMixin,
                         serializers.HyperlinkedModelSerializer):
-    project_groups = NestedProjectGroupSerializer(
-        queryset=models.ProjectGroup.objects.all(),
-        many=True,
-        required=False,
-        default=(),
-    )
-
     quotas = quotas_serializers.BasicQuotaSerializer(many=True, read_only=True)
     services = serializers.SerializerMethodField()
+    certifications = NestedServiceCertificationSerializer(
+        queryset=models.ServiceCertification.objects.all(),
+        many=True, required=False)
 
     class Meta(object):
         model = models.Project
@@ -213,19 +203,21 @@ class ProjectSerializer(core_serializers.RestrictedSerializerMixin,
             'url', 'uuid',
             'name',
             'customer', 'customer_uuid', 'customer_name', 'customer_native_name', 'customer_abbreviation',
-            'project_groups',
             'description',
             'quotas',
             'services',
             'created',
+            'certifications',
         )
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
             'customer': {'lookup_field': 'uuid'},
+            'certifications': {'lookup_field': 'uuid'},
         }
         related_paths = {
             'customer': ('uuid', 'name', 'native_name', 'abbreviation')
         }
+        protected_fields = ('certifications',)
 
     @staticmethod
     def eager_load(queryset):
@@ -237,15 +229,15 @@ class ProjectSerializer(core_serializers.RestrictedSerializerMixin,
             'customer__uuid',
             'customer__name',
             'customer__native_name',
-            'customer__abbreviation'
+            'customer__abbreviation',
         )
-        return queryset.select_related('customer').only(*related_fields) \
-            .prefetch_related('quotas', 'project_groups')
+        return queryset.select_related('customer').only(*related_fields)\
+            .prefetch_related('quotas', 'certifications')
 
     def create(self, validated_data):
-        project_groups = validated_data.pop('project_groups')
+        certifications = validated_data.pop('certifications', [])
         project = super(ProjectSerializer, self).create(validated_data)
-        project.project_groups.add(*project_groups)
+        project.certifications.add(*certifications)
 
         return project
 
@@ -271,16 +263,15 @@ class ProjectSerializer(core_serializers.RestrictedSerializerMixin,
             'service__settings__state',
             'project_id',
             'service__uuid',
-            'service__name',
             'service__settings__uuid',
-            'service__settings__shared'
+            'service__settings__shared',
+            'service__settings__name',
         )
-        for service in SupportedServices.get_service_models().values():
-            link_model = service['service_project_link']
-            links = link_model.objects.all()
-            if not hasattr(link_model, 'cloud'):
-                links = links.select_related('service', 'service__settings') \
-                             .only(*related_fields)
+        for link_model in ServiceProjectLink.get_all_models():
+            links = (link_model.objects.all()
+                     .select_related('service', 'service__settings')
+                     .only(*related_fields)
+                     .prefetch_related('service__settings__certifications'))
             if isinstance(self.instance, list):
                 links = links.filter(project__in=self.instance)
             else:
@@ -288,13 +279,6 @@ class ProjectSerializer(core_serializers.RestrictedSerializerMixin,
             for link in links:
                 services[link.project_id].append(link)
         return services
-
-    def update(self, instance, validated_data):
-        if 'project_groups' in validated_data:
-            project_groups = validated_data.pop('project_groups')
-            instance.project_groups.clear()
-            instance.project_groups.add(*project_groups)
-        return super(ProjectSerializer, self).update(instance, validated_data)
 
 
 class CustomerImageSerializer(serializers.ModelSerializer):
@@ -309,8 +293,8 @@ class CustomerSerializer(core_serializers.RestrictedSerializerMixin,
                          core_serializers.AugmentedSerializerMixin,
                          serializers.HyperlinkedModelSerializer,):
     projects = PermissionProjectSerializer(many=True, read_only=True)
-    project_groups = PermissionProjectGroupSerializer(many=True, read_only=True)
     owners = BasicUserSerializer(source='get_owners', many=True, read_only=True)
+    support_users = BasicUserSerializer(source='get_support_users', many=True, read_only=True)
     image = serializers.SerializerMethodField()
     quotas = quotas_serializers.BasicQuotaSerializer(many=True, read_only=True)
 
@@ -320,8 +304,8 @@ class CustomerSerializer(core_serializers.RestrictedSerializerMixin,
             'url',
             'uuid',
             'name', 'native_name', 'abbreviation', 'contact_details',
-            'projects', 'project_groups',
-            'owners', 'balance',
+            'projects',
+            'owners', 'support_users', 'balance',
             'registration_code',
             'quotas',
             'image',
@@ -331,7 +315,7 @@ class CustomerSerializer(core_serializers.RestrictedSerializerMixin,
             'url': {'lookup_field': 'uuid'},
         }
         # Balance should be modified by nodeconductor_paypal app
-        read_only_fields = ('balance', )
+        read_only_fields = ('balance',)
 
     def get_image(self, customer):
         if not customer.image:
@@ -340,7 +324,7 @@ class CustomerSerializer(core_serializers.RestrictedSerializerMixin,
 
     @staticmethod
     def eager_load(queryset):
-        return queryset.prefetch_related('quotas', 'projects', 'project_groups')
+        return queryset.prefetch_related('quotas', 'projects')
 
     def validate(self, attrs):
         country = attrs.get('country')
@@ -350,79 +334,104 @@ class CustomerSerializer(core_serializers.RestrictedSerializerMixin,
         if vat_code:
             if not is_company:
                 raise serializers.ValidationError({
-                    'vat_code': 'VAT number is not supported for private persons.'})
+                    'vat_code': _('VAT number is not supported for private persons.')})
 
             # Check VAT format
             if not pyvat.is_vat_number_format_valid(vat_code, country):
-                raise serializers.ValidationError({'vat_code': 'VAT number has invalid format.'})
+                raise serializers.ValidationError({'vat_code': _('VAT number has invalid format.')})
 
             # Check VAT number in EU VAT Information Exchange System
             # if customer is new or either VAT number or country of the customer has changed
             if not self.instance or self.instance.vat_code != vat_code or self.instance.country != country:
                 check_result = pyvat.check_vat_number(vat_code, country)
                 if check_result.is_valid:
-                    self.instance.vat_name = check_result.business_name
-                    self.instance.vat_address = check_result.business_address
-                    self.instance.save(update_fields=['vat_name', 'vat_address'])
-                elif check_result.is_valid == False:
-                    raise serializers.ValidationError({'vat_code': 'VAT number is invalid.'})
+                    attrs['vat_name'] = check_result.business_name
+                    attrs['vat_address'] = check_result.business_address
+                    if not attrs.get('contact_details'):
+                        attrs['contact_details'] = attrs['vat_address']
+                elif check_result.is_valid is False:
+                    raise serializers.ValidationError({'vat_code': _('VAT number is invalid.')})
                 else:
                     logger.debug('Unable to check VAT number %s for country %s. Error message: %s',
                                  vat_code, country, check_result.log_lines)
-                    raise serializers.ValidationError({'vat_code': 'Unable to check VAT number.'})
+                    raise serializers.ValidationError({'vat_code': _('Unable to check VAT number.')})
         return attrs
 
 
+class NestedProjectPermissionSerializer(serializers.ModelSerializer):
+    url = serializers.HyperlinkedRelatedField(
+        source='project',
+        lookup_field='uuid',
+        view_name='project-detail',
+        queryset=models.Project.objects.all(),
+    )
+    uuid = serializers.ReadOnlyField(source='project.uuid')
+    name = serializers.ReadOnlyField(source='project.name')
+    permission = serializers.HyperlinkedRelatedField(
+        source='pk',
+        view_name='project_permission-detail',
+        queryset=models.ProjectPermission.objects.all(),
+    )
+
+    class Meta:
+        model = models.ProjectPermission
+        fields = ['url', 'uuid', 'name', 'role', 'permission', 'expiration_time']
+
+
 class CustomerUserSerializer(serializers.ModelSerializer):
-    role = serializers.ReadOnlyField(source='group.customerrole.get_role_type_display')
+    role = serializers.ReadOnlyField()
+    expiration_time = serializers.ReadOnlyField(source='perm.expiration_time')
     permission = serializers.HyperlinkedRelatedField(
         source='perm.pk',
         view_name='customer_permission-detail',
-        queryset=User.groups.through.objects.all(),
+        queryset=models.CustomerPermission.objects.all(),
     )
-    projects = serializers.SerializerMethodField()
+    projects = NestedProjectPermissionSerializer(many=True, read_only=True)
 
     class Meta:
         model = User
-        fields = ['url', 'uuid', 'username', 'full_name', 'role', 'permission', 'projects']
+        fields = ['url', 'uuid', 'username', 'full_name', 'email', 'role', 'permission', 'projects',
+                  'expiration_time']
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
         }
 
     def to_representation(self, user):
         customer = self.context['customer']
-        try:
-            group = user.groups.get(customerrole__customer=customer)
-        except user.groups.model.DoesNotExist:
-            group = None
-            perm = None
-        else:
-            perm = User.groups.through.objects.get(user=user, group=group)
-
-        setattr(user, 'group', group)
-        setattr(user, 'perm', perm)
+        permission = models.CustomerPermission.objects.filter(
+            customer=customer, user=user, is_active=True).first()
+        projects = models.ProjectPermission.objects.filter(
+            project__customer=customer, user=user, is_active=True)
+        setattr(user, 'perm', permission)
+        setattr(user, 'role', permission and permission.role)
+        setattr(user, 'projects', projects)
         return super(CustomerUserSerializer, self).to_representation(user)
 
-    def get_projects(self, user):
-        request = self.context['request']
-        customer = self.context['customer']
-        projectrole = {
-            g.projectrole.project_id: (g.projectrole.get_role_type_display(),
-                                       User.groups.through.objects.get(user=user, group=g).pk)
-            for g in user.groups.exclude(projectrole=None)
-        }
-        projects = filter_queryset_for_user(
-            models.Project.objects.filter(customer=customer).filter(id__in=projectrole.keys()), request.user)
 
-        return [OrderedDict([
-            ('url', reverse('project-detail', kwargs={'uuid': proj.uuid}, request=request)),
-            ('uuid', proj.uuid),
-            ('name', proj.name),
-            ('role', projectrole[proj.id][0]),
-            ('permission', reverse('project_permission-detail',
-                                   kwargs={'pk': projectrole[proj.id][1]},
-                                   request=request))
-        ]) for proj in projects]
+class ProjectUserSerializer(serializers.ModelSerializer):
+    role = serializers.ReadOnlyField()
+    expiration_time = serializers.ReadOnlyField(source='perm.expiration_time')
+    permission = serializers.HyperlinkedRelatedField(
+        source='perm.pk',
+        view_name='project_permission-detail',
+        queryset=models.ProjectPermission.objects.all(),
+    )
+
+    class Meta:
+        model = User
+        fields = ['url', 'uuid', 'username', 'full_name', 'email', 'role', 'permission',
+                  'expiration_time']
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid'},
+        }
+
+    def to_representation(self, user):
+        project = self.context['project']
+        permission = models.ProjectPermission.objects.filter(
+            project=project, user=user, is_active=True).first()
+        setattr(user, 'perm', permission)
+        setattr(user, 'role', permission and permission.role)
+        return super(ProjectUserSerializer, self).to_representation(user)
 
 
 class BalanceHistorySerializer(serializers.ModelSerializer):
@@ -431,282 +440,153 @@ class BalanceHistorySerializer(serializers.ModelSerializer):
         fields = ['created', 'amount']
 
 
-class ProjectGroupSerializer(PermissionFieldFilteringMixin,
-                             core_serializers.AugmentedSerializerMixin,
-                             serializers.HyperlinkedModelSerializer):
-    projects = PermissionProjectSerializer(many=True, read_only=True)
-
+class BasePermissionSerializer(core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer):
     class Meta(object):
-        model = models.ProjectGroup
-        fields = (
-            'url',
-            'uuid',
-            'name',
-            'customer', 'customer_name', 'customer_native_name', 'customer_abbreviation',
-            'projects',
-            'description',
-        )
-        extra_kwargs = {
-            'url': {'lookup_field': 'uuid'},
-            'customer': {'lookup_field': 'uuid'},
-        }
+        fields = ('user', 'user_full_name', 'user_native_name', 'user_username', 'user_uuid', 'user_email')
         related_paths = {
-            'customer': ('uuid', 'name', 'native_name', 'abbreviation')
+            'user': ('username', 'full_name', 'native_name', 'uuid', 'email'),
         }
-        protected_fields = ('customer',)
 
-    def get_filtered_field_names(self):
-        return 'customer',
+    def validate_user(self, user):
+        if self.context['request'].user == user:
+            raise serializers.ValidationError(_('It is impossible to edit permissions for yourself.'))
+        return user
 
 
-class ProjectGroupMembershipSerializer(PermissionFieldFilteringMixin,
-                                       serializers.HyperlinkedModelSerializer):
-    project_group = serializers.HyperlinkedRelatedField(
-        source='projectgroup',
-        view_name='projectgroup-detail',
-        lookup_field='uuid',
-        queryset=models.ProjectGroup.objects.all(),
-    )
-    project_group_name = serializers.ReadOnlyField(source='projectgroup.name')
-    project = serializers.HyperlinkedRelatedField(
-        view_name='project-detail',
-        lookup_field='uuid',
-        queryset=models.Project.objects.all(),
-    )
-    project_name = serializers.ReadOnlyField(source='project.name')
-
-    class Meta(object):
-        model = models.ProjectGroup.projects.through
+class CustomerPermissionSerializer(PermissionFieldFilteringMixin, BasePermissionSerializer):
+    class Meta(BasePermissionSerializer.Meta):
+        model = models.CustomerPermission
         fields = (
-            'url',
-            'project_group', 'project_group_name',
-            'project', 'project_name',
-        )
-        view_name = 'projectgroup_membership-detail'
-
-    def get_filtered_field_names(self):
-        return 'project', 'project_group'
-
-
-STRUCTURE_PERMISSION_USER_FIELDS = {
-    'fields': ('user', 'user_full_name', 'user_native_name', 'user_username', 'user_uuid', 'user_email'),
-    'path': ('username', 'full_name', 'native_name', 'uuid', 'email')
-}
-
-
-class CustomerPermissionSerializer(PermissionFieldFilteringMixin,
-                                   core_serializers.AugmentedSerializerMixin,
-                                   serializers.HyperlinkedModelSerializer):
-    customer = serializers.HyperlinkedRelatedField(
-        source='group.customerrole.customer',
-        view_name='customer-detail',
-        lookup_field='uuid',
-        queryset=models.Customer.objects.all(),
-    )
-
-    role = MappedChoiceField(
-        source='group.customerrole.role_type',
-        choices=(
-            ('owner', 'Owner'),
-        ),
-        choice_mappings={
-            'owner': models.CustomerRole.OWNER,
-        },
-    )
-
-    class Meta(object):
-        model = User.groups.through
-        fields = (
-            'url', 'pk', 'role',
+            'url', 'pk', 'role', 'created', 'expiration_time', 'created_by',
             'customer', 'customer_uuid', 'customer_name', 'customer_native_name', 'customer_abbreviation',
-        ) + STRUCTURE_PERMISSION_USER_FIELDS['fields']
-        related_paths = {
-            'user': STRUCTURE_PERMISSION_USER_FIELDS['path'],
-            'group.customerrole.customer': ('name', 'native_name', 'abbreviation', 'uuid')
-        }
+        ) + BasePermissionSerializer.Meta.fields
+        related_paths = dict(
+            customer=('name', 'native_name', 'abbreviation', 'uuid'),
+            **BasePermissionSerializer.Meta.related_paths
+        )
+        protected_fields = (
+            'customer', 'role', 'user', 'created_by', 'created'
+        )
         extra_kwargs = {
             'user': {
                 'view_name': 'user-detail',
                 'lookup_field': 'uuid',
                 'queryset': User.objects.all(),
             },
+            'created_by': {
+                'view_name': 'user-detail',
+                'lookup_field': 'uuid',
+                'read_only': True,
+            },
+            'customer': {
+                'view_name': 'customer-detail',
+                'lookup_field': 'uuid',
+                'queryset': models.Customer.objects.all(),
+            }
         }
-        view_name = 'customer_permission-detail'
+
+    def validate(self, data):
+        if not self.instance:
+            customer = data['customer']
+            user = data['user']
+
+            if customer.has_user(user):
+                raise serializers.ValidationError(_('The fields customer and user must make a unique set.'))
+
+        return data
 
     def create(self, validated_data):
         customer = validated_data['customer']
         user = validated_data['user']
         role = validated_data['role']
+        expiration_time = validated_data.get('expiration_time')
 
-        permission, _ = customer.add_user(user, role)
+        created_by = self.context['request'].user
+        permission, _ = customer.add_user(user, role, created_by, expiration_time)
 
         return permission
 
-    def to_internal_value(self, data):
-        value = super(CustomerPermissionSerializer, self).to_internal_value(data)
-        return {
-            'user': value['user'],
-            'customer': value['group']['customerrole']['customer'],
-            'role': value['group']['customerrole']['role_type'],
-        }
-
-    def validate(self, data):
-        customer = data['customer']
-        user = data['user']
-        role = data['role']
-
-        if customer.has_user(user, role):
-            raise serializers.ValidationError('The fields customer, user, role must make a unique set.')
-
-        return data
+    def validate_expiration_time(self, value):
+        if value is not None and value < timezone.now():
+            raise serializers.ValidationError(_('Expiration time should be greater than current time.'))
+        return value
 
     def get_filtered_field_names(self):
-        return 'customer',
+        return ('customer',)
 
 
-class ProjectPermissionSerializer(PermissionFieldFilteringMixin,
-                                  core_serializers.AugmentedSerializerMixin,
-                                  serializers.HyperlinkedModelSerializer):
-    project = serializers.HyperlinkedRelatedField(
-        source='group.projectrole.project',
-        view_name='project-detail',
-        lookup_field='uuid',
-        queryset=models.Project.objects.all(),
-    )
+class CustomerPermissionLogSerializer(CustomerPermissionSerializer):
+    class Meta(CustomerPermissionSerializer.Meta):
+        view_name = 'customer_permission_log-detail'
 
-    role = MappedChoiceField(
-        source='group.projectrole.role_type',
-        choices=(
-            ('admin', 'Administrator'),
-            ('manager', 'Manager'),
-        ),
-        choice_mappings={
-            'admin': models.ProjectRole.ADMINISTRATOR,
-            'manager': models.ProjectRole.MANAGER,
-        },
-    )
 
-    class Meta(object):
-        model = User.groups.through
+class ProjectPermissionSerializer(PermissionFieldFilteringMixin, BasePermissionSerializer):
+    customer_name = serializers.ReadOnlyField(source='project.customer.name')
+
+    class Meta(BasePermissionSerializer.Meta):
+        model = models.ProjectPermission
         fields = (
-            'url', 'pk',
-            'role',
-            'project', 'project_uuid', 'project_name',
-        ) + STRUCTURE_PERMISSION_USER_FIELDS['fields']
-
-        related_paths = {
-            'group.projectrole.project': ('name', 'uuid'),
-            'user': STRUCTURE_PERMISSION_USER_FIELDS['path']
-        }
+            'url', 'pk', 'role', 'created', 'expiration_time', 'created_by',
+            'project', 'project_uuid', 'project_name', 'customer_name'
+        ) + BasePermissionSerializer.Meta.fields
+        related_paths = dict(
+            project=('name', 'uuid'),
+            **BasePermissionSerializer.Meta.related_paths
+        )
+        protected_fields = (
+            'project', 'role', 'user', 'created_by', 'created'
+        )
         extra_kwargs = {
             'user': {
                 'view_name': 'user-detail',
                 'lookup_field': 'uuid',
                 'queryset': User.objects.all(),
             },
+            'created_by': {
+                'view_name': 'user-detail',
+                'lookup_field': 'uuid',
+                'read_only': True,
+            },
+            'project': {
+                'view_name': 'project-detail',
+                'lookup_field': 'uuid',
+                'queryset': models.Project.objects.all(),
+            }
         }
-        view_name = 'project_permission-detail'
+
+    def validate(self, data):
+        if not self.instance:
+            project = data['project']
+            user = data['user']
+
+            if project.has_user(user):
+                raise serializers.ValidationError(_('The fields project and user must make a unique set.'))
+
+        return data
 
     def create(self, validated_data):
         project = validated_data['project']
         user = validated_data['user']
         role = validated_data['role']
+        expiration_time = validated_data.get('expiration_time')
 
-        permission, _ = project.add_user(user, role)
-
-        return permission
-
-    def to_internal_value(self, data):
-        value = super(ProjectPermissionSerializer, self).to_internal_value(data)
-        return {
-            'user': value['user'],
-            'project': value['group']['projectrole']['project'],
-            'role': value['group']['projectrole']['role_type'],
-        }
-
-    def validate(self, data):
-        project = data['project']
-        user = data['user']
-        role = data['role']
-
-        if project.has_user(user, role):
-            raise serializers.ValidationError('The fields project, user, role must make a unique set.')
-
-        return data
-
-    def get_filtered_field_names(self):
-        return 'project',
-
-
-class ProjectGroupPermissionSerializer(PermissionFieldFilteringMixin,
-                                       core_serializers.AugmentedSerializerMixin,
-                                       serializers.HyperlinkedModelSerializer):
-    project_group = serializers.HyperlinkedRelatedField(
-        source='group.projectgrouprole.project_group',
-        view_name='projectgroup-detail',
-        lookup_field='uuid',
-        queryset=models.ProjectGroup.objects.all(),
-    )
-
-    role = MappedChoiceField(
-        source='group.projectgrouprole.role_type',
-        choices=(
-            ('manager', 'Manager'),
-        ),
-        choice_mappings={
-            'manager': models.ProjectGroupRole.MANAGER,
-        },
-    )
-
-    class Meta(object):
-        model = User.groups.through
-        fields = (
-            'url', 'pk',
-            'role',
-            'project_group', 'project_group_uuid', 'project_group_name',
-        ) + STRUCTURE_PERMISSION_USER_FIELDS['fields']
-        related_paths = {
-            'user': STRUCTURE_PERMISSION_USER_FIELDS['path'],
-            'group.projectgrouprole.project_group': ('name', 'uuid'),
-        }
-        extra_kwargs = {
-            'user': {
-                'view_name': 'user-detail',
-                'lookup_field': 'uuid',
-                'queryset': User.objects.all(),
-            },
-        }
-        view_name = 'projectgroup_permission-detail'
-
-    def create(self, validated_data):
-        project_group = validated_data['project_group']
-        user = validated_data['user']
-        role = validated_data['role']
-
-        permission, _ = project_group.add_user(user, role)
+        created_by = self.context['request'].user
+        permission, _ = project.add_user(user, role, created_by, expiration_time)
 
         return permission
 
-    def to_internal_value(self, data):
-        value = super(ProjectGroupPermissionSerializer, self).to_internal_value(data)
-        return {
-            'user': value['user'],
-            'project_group': value['group']['projectgrouprole']['project_group'],
-            'role': value['group']['projectgrouprole']['role_type'],
-        }
-
-    def validate(self, data):
-        project_group = data['project_group']
-        user = data['user']
-        role = data['role']
-
-        if project_group.has_user(user, role):
-            raise serializers.ValidationError('The fields project_group, user, role must make a unique set.')
-
-        return data
+    def validate_expiration_time(self, value):
+        if value is not None and value < timezone.now():
+            raise serializers.ValidationError(_('Expiration time should be greater than current time.'))
+        return value
 
     def get_filtered_field_names(self):
-        return 'project_group',
+        return ('project',)
+
+
+class ProjectPermissionLogSerializer(ProjectPermissionSerializer):
+    class Meta(ProjectPermissionSerializer.Meta):
+        view_name = 'project_permission_log-detail'
 
 
 class UserOrganizationSerializer(serializers.Serializer):
@@ -715,6 +595,13 @@ class UserOrganizationSerializer(serializers.Serializer):
 
 class UserSerializer(serializers.HyperlinkedModelSerializer):
     email = serializers.EmailField()
+    agree_with_policy = serializers.BooleanField(write_only=True, required=False,
+                                                 help_text=_('User must agree with the policy to register.'))
+    preferred_language = serializers.ChoiceField(choices=settings.LANGUAGES, allow_blank=True, required=False)
+    competence = serializers.ChoiceField(choices=settings.NODECONDUCTOR.get('USER_COMPETENCE_LIST', []),
+                                         allow_blank=True,
+                                         required=False)
+    token = serializers.ReadOnlyField(source='auth_token.key')
 
     class Meta(object):
         model = User
@@ -726,15 +613,22 @@ class UserSerializer(serializers.HyperlinkedModelSerializer):
             'organization', 'organization_approved',
             'civil_number',
             'description',
-            'is_staff', 'is_active',
+            'is_staff', 'is_active', 'is_support',
+            'token', 'token_lifetime',
+            'registration_method',
             'date_joined',
+            'agree_with_policy',
+            'agreement_date',
+            'preferred_language',
+            'competence'
         )
         read_only_fields = (
             'uuid',
             'civil_number',
-            'organization',
             'organization_approved',
+            'registration_method',
             'date_joined',
+            'agreement_date',
         )
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
@@ -749,25 +643,52 @@ class UserSerializer(serializers.HyperlinkedModelSerializer):
         except (KeyError, AttributeError):
             return fields
 
-        if not user.is_staff:
+        if not user.is_staff and not user.is_support:
             del fields['is_active']
             del fields['is_staff']
-            fields['description'].read_only = True
+            del fields['description']
+
+        if not self._can_see_token(user):
+            del fields['token']
+            del fields['token_lifetime']
 
         if request.method in ('PUT', 'PATCH'):
             fields['username'].read_only = True
 
         return fields
 
+    def _can_see_token(self, user):
+        # Staff can see any token
+        # User can see his own token either via details view or /api/users/?current
+
+        if user.is_staff:
+            return True
+        elif isinstance(self.instance, list) and len(self.instance) == 1:
+            return self.instance[0] == user
+        else:
+            return self.instance == user
+
     def validate(self, attrs):
-        user = User(id=getattr(self.instance, 'id', None), **attrs)
-        user.clean()
+        agree_with_policy = attrs.pop('agree_with_policy', False)
+        if self.instance and not self.instance.agreement_date:
+            if not agree_with_policy:
+                raise serializers.ValidationError({'agree_with_policy': _('User must agree with the policy.')})
+            else:
+                attrs['agreement_date'] = timezone.now()
+
+        # Convert validation error from Django to DRF
+        # https://github.com/tomchristie/django-rest-framework/issues/2145
+        try:
+            user = User(id=getattr(self.instance, 'id', None), **attrs)
+            user.clean()
+        except django_exceptions.ValidationError as error:
+            raise exceptions.ValidationError(error.message_dict)
         return attrs
 
 
 class CreationTimeStatsSerializer(serializers.Serializer):
-    MODEL_NAME_CHOICES = (('project', 'project'), ('customer', 'customer'), ('project_group', 'project_group'))
-    MODEL_CLASSES = {'project': models.Project, 'customer': models.Customer, 'project_group': models.ProjectGroup}
+    MODEL_NAME_CHOICES = (('project', 'project'), ('customer', 'customer'),)
+    MODEL_CLASSES = {'project': models.Project, 'customer': models.Customer}
 
     model_name = serializers.ChoiceField(choices=MODEL_NAME_CHOICES)
     start_timestamp = serializers.IntegerField(min_value=0)
@@ -798,11 +719,11 @@ class PasswordSerializer(serializers.Serializer):
     password = serializers.CharField(min_length=7, validators=[
         RegexValidator(
             regex='\d',
-            message='Ensure this field has at least one digit.',
+            message=_('Ensure this field has at least one digit.'),
         ),
         RegexValidator(
             regex='[a-zA-Z]',
-            message='Ensure this field has at least one latin letter.',
+            message=_('Ensure this field has at least one latin letter.'),
         ),
     ])
 
@@ -822,9 +743,9 @@ class SshKeySerializer(serializers.HyperlinkedModelSerializer):
         try:
             fingerprint = core_models.get_ssh_key_fingerprint(attrs['public_key'])
         except (IndexError, TypeError):
-            raise serializers.ValidationError('Key is not valid: cannot generate fingerprint from it.')
+            raise serializers.ValidationError(_('Key is not valid: cannot generate fingerprint from it.'))
         if core_models.SshPublicKey.objects.filter(fingerprint=fingerprint).exists():
-            raise serializers.ValidationError('Key with same fingerprint already exists')
+            raise serializers.ValidationError(_('Key with same fingerprint already exists.'))
         return attrs
 
     def get_fields(self):
@@ -841,10 +762,32 @@ class SshKeySerializer(serializers.HyperlinkedModelSerializer):
         return fields
 
 
+class ServiceCertificationsUpdateSerializer(serializers.Serializer):
+    certifications = NestedServiceCertificationSerializer(
+        queryset=models.ServiceCertification.objects.all(),
+        required=True,
+        many=True)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        certifications = validated_data.pop('certifications', None)
+        instance.certifications.clear()
+        instance.certifications.add(*certifications)
+        return instance
+
+
+class ServiceCertificationSerializer(serializers.HyperlinkedModelSerializer):
+    class Meta(object):
+        model = models.ServiceCertification
+        fields = ('uuid', 'url', 'name', 'description', 'link')
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid', 'view_name': 'service-certification-detail'},
+        }
+
+
 class ServiceSettingsSerializer(PermissionFieldFilteringMixin,
                                 core_serializers.AugmentedSerializerMixin,
                                 serializers.HyperlinkedModelSerializer):
-
     customer_native_name = serializers.ReadOnlyField(source='customer.native_name')
     state = MappedChoiceField(
         choices=[(v, k) for k, v in core_models.SynchronizationStates.CHOICES],
@@ -852,6 +795,8 @@ class ServiceSettingsSerializer(PermissionFieldFilteringMixin,
         read_only=True)
     quotas = quotas_serializers.BasicQuotaSerializer(many=True, read_only=True)
     scope = core_serializers.GenericRelatedField(related_models=models.ResourceMixin.get_all_models(), required=False)
+    certifications = NestedServiceCertificationSerializer(many=True, read_only=True)
+    geolocations = core_serializers.JSONField(read_only=True)
 
     class Meta(object):
         model = models.ServiceSettings
@@ -859,19 +804,28 @@ class ServiceSettingsSerializer(PermissionFieldFilteringMixin,
             'url', 'uuid', 'name', 'type', 'state', 'error_message', 'shared',
             'backend_url', 'username', 'password', 'token', 'certificate',
             'customer', 'customer_name', 'customer_native_name',
-            'quotas', 'scope',
+            'homepage', 'terms_of_services', 'certifications',
+            'quotas', 'scope', 'geolocations',
         )
         protected_fields = ('type', 'customer')
         read_only_fields = ('shared', 'state', 'error_message')
-        write_only_fields = ('backend_url', 'username', 'token', 'password', 'certificate')
         related_paths = ('customer',)
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
             'customer': {'lookup_field': 'uuid'},
+            'certifications': {'lookup_field': 'uuid'},
         }
+        write_only_fields = ('backend_url', 'username', 'token', 'password', 'certificate')
+        for field in write_only_fields:
+            field_params = extra_kwargs.setdefault(field, {})
+            field_params['write_only'] = True
 
     def get_filtered_field_names(self):
         return 'customer',
+
+    @staticmethod
+    def eager_load(queryset):
+        return queryset.select_related('customer').prefetch_related('quotas', 'certifications')
 
     def get_fields(self):
         fields = super(ServiceSettingsSerializer, self).get_fields()
@@ -920,6 +874,7 @@ class ServiceSerializerMetaclass(serializers.SerializerMetaclass):
     """ Build a list of supported services via serializers definition.
         See SupportedServices for details.
     """
+
     def __new__(cls, name, bases, args):
         SupportedServices.register_service(args['Meta'].model)
         serializer = super(ServiceSerializerMetaclass, cls).__new__(cls, name, bases, args)
@@ -946,7 +901,7 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
     # if project is defined service will be automatically connected to projects customer
     # and SPL between service and project will be created
     project = serializers.HyperlinkedRelatedField(
-        queryset=models.Project.objects.all(),
+        queryset=models.Project.objects.all().select_related('customer'),
         view_name='project-detail',
         lookup_field='uuid',
         allow_null=True,
@@ -956,30 +911,35 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
     backend_url = serializers.URLField(max_length=200, allow_null=True, write_only=True, required=False)
     username = serializers.CharField(max_length=100, allow_null=True, write_only=True, required=False)
     password = serializers.CharField(max_length=100, allow_null=True, write_only=True, required=False)
+    domain = serializers.CharField(max_length=200, allow_null=True, write_only=True, required=False)
     token = serializers.CharField(allow_null=True, write_only=True, required=False)
     certificate = serializers.FileField(allow_null=True, write_only=True, required=False)
     resources_count = serializers.SerializerMethodField()
     service_type = serializers.SerializerMethodField()
-    shared = serializers.ReadOnlyField(source='settings.shared')
     state = serializers.SerializerMethodField()
-    error_message = serializers.ReadOnlyField(source='settings.error_message')
     scope = core_serializers.GenericRelatedField(related_models=models.ResourceMixin.get_all_models(), required=False)
     tags = serializers.SerializerMethodField()
+    quotas = quotas_serializers.BasicQuotaSerializer(many=True, read_only=True)
+
+    shared = serializers.ReadOnlyField(source='settings.shared')
+    error_message = serializers.ReadOnlyField(source='settings.error_message')
+    terms_of_services = serializers.ReadOnlyField(source='settings.terms_of_services')
+    homepage = serializers.ReadOnlyField(source='settings.homepage')
+    geolocations = core_serializers.JSONField(source='settings.geolocations', read_only=True)
+    certifications = NestedServiceCertificationSerializer(many=True, read_only=True, source='settings.certifications')
+    name = serializers.ReadOnlyField(source='settings.name')
 
     class Meta(object):
         model = NotImplemented
-        view_name = NotImplemented
         fields = (
-            'uuid',
-            'url',
-            'name', 'projects', 'project',
-            'customer', 'customer_uuid', 'customer_name', 'customer_native_name',
-            'settings', 'settings_uuid',
-            'backend_url', 'username', 'password', 'token', 'certificate',
-            'resources_count', 'service_type', 'shared', 'state', 'error_message',
-            'available_for_all', 'scope', 'tags',
+            'uuid', 'url', 'name', 'state', 'service_type', 'shared',
+            'projects', 'project',
+            'customer', 'customer_uuid', 'customer_name', 'customer_native_name', 'resources_count',
+            'settings', 'settings_uuid', 'backend_url', 'username', 'password',
+            'token', 'certificate', 'domain', 'terms_of_services', 'homepage',
+            'certifications', 'geolocations', 'available_for_all', 'scope', 'tags', 'quotas',
         )
-        settings_fields = ('backend_url', 'username', 'password', 'token', 'certificate', 'scope')
+        settings_fields = ('backend_url', 'username', 'password', 'token', 'certificate', 'scope', 'domain')
         protected_fields = ('customer', 'settings', 'project') + settings_fields
         related_paths = ('customer', 'settings')
         extra_kwargs = {
@@ -998,24 +958,27 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
     def eager_load(queryset):
         related_fields = (
             'uuid',
-            'name',
             'available_for_all',
             'customer__uuid',
             'customer__name',
             'customer__native_name',
             'settings__state',
             'settings__uuid',
+            'settings__name',
             'settings__type',
             'settings__shared',
             'settings__error_message',
-            'settings__tags',
+            'settings__options',
+            'settings__domain',
+            'settings__terms_of_services',
+            'settings__homepage',
         )
         queryset = queryset.select_related('customer', 'settings').only(*related_fields)
         projects = models.Project.objects.all().only('uuid', 'name')
-        return queryset.prefetch_related(django_models.Prefetch('projects', queryset=projects))
+        return queryset.prefetch_related(django_models.Prefetch('projects', queryset=projects), 'quotas')
 
     def get_tags(self, service):
-        return [t.name for t in service.settings.tags.all()]
+        return service.settings.get_tags()
 
     def get_filtered_field_names(self):
         return 'customer',
@@ -1029,7 +992,7 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
 
         if self.SERVICE_ACCOUNT_FIELDS is not NotImplemented:
             # each service settings could be connected to scope
-            self.SERVICE_ACCOUNT_FIELDS['scope'] = 'VM that contains service'
+            self.SERVICE_ACCOUNT_FIELDS['scope'] = _('VM that contains service')
             for field in self.Meta.settings_fields:
                 if field not in fields:
                     continue
@@ -1064,12 +1027,12 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
         return super(BaseServiceSerializer, self).validate_empty_values(data)
 
     def validate(self, attrs):
-        user = self.context['user']
+        user = self.context['request'].user
         customer = attrs.get('customer') or self.instance.customer
         project = attrs.get('project')
         if project and project.customer != customer:
             raise serializers.ValidationError(
-                'Service cannot be connected to project that does not belong to services customer.')
+                _('Service cannot be connected to project that does not belong to services customer.'))
 
         settings = attrs.get('settings')
         if not user.is_staff:
@@ -1077,15 +1040,18 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
                 raise exceptions.PermissionDenied()
             if not self.instance and settings and not settings.shared:
                 if attrs.get('customer') != settings.customer:
-                    raise serializers.ValidationError('Customer must match settings customer.')
+                    raise serializers.ValidationError(_('Customer must match settings customer.'))
 
         if self.context['request'].method == 'POST':
+            name = self.initial_data.get('name')
+            if not name or not name.strip():
+                raise serializers.ValidationError({'name': 'Name cannot be empty'})
             # Make shallow copy to protect from mutations
             settings_fields = self.Meta.settings_fields[:]
             create_settings = any([attrs.get(f) for f in settings_fields])
             if not settings and not create_settings:
                 raise serializers.ValidationError(
-                    "Either service settings or credentials must be supplied.")
+                    _('Either service settings or credentials must be supplied.'))
 
             extra_fields = tuple()
             if self.SERVICE_ACCOUNT_EXTRA_FIELDS is not NotImplemented:
@@ -1102,9 +1068,13 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
                 if extra_fields:
                     args['options'] = {f: attrs[f] for f in extra_fields if f in attrs}
 
+                name = self.initial_data.get('name')
+                if name is None:
+                    raise serializers.ValidationError({'name': _('Name field is required.')})
+
                 settings = models.ServiceSettings(
                     type=SupportedServices.get_model_key(self.Meta.model),
-                    name=attrs['name'],
+                    name=name,
                     customer=customer,
                     **args)
 
@@ -1112,9 +1082,11 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
                     backend = settings.get_backend()
                     backend.ping(raise_exception=True)
                 except ServiceBackendError as e:
-                    raise serializers.ValidationError("Wrong settings: %s" % e)
+                    raise serializers.ValidationError(_('Wrong settings: %s.') % e)
                 except ServiceBackendNotImplemented:
                     pass
+
+                self._validate_settings(settings)
 
                 settings.save()
                 executors.ServiceSettingsCreateExecutor.execute(settings)
@@ -1125,6 +1097,9 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
                     del attrs[f]
 
         return attrs
+
+    def _validate_settings(self, settings):
+        pass
 
     def get_resources_count(self, service):
         return self.get_resources_count_map[service.pk]
@@ -1157,16 +1132,15 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
     def create(self, attrs):
         project = attrs.pop('project', None)
         service = super(BaseServiceSerializer, self).create(attrs)
-        if project:
-            spl = service.projects.through
-            spl.objects.create(project=project, service=service)
+        spl_model = service.projects.through
+        if project and not spl_model.objects.filter(project=project, service=service).exists():
+            spl_model.objects.create(project=project, service=service)
         return service
 
 
 class BaseServiceProjectLinkSerializer(PermissionFieldFilteringMixin,
                                        core_serializers.AugmentedSerializerMixin,
                                        serializers.HyperlinkedModelSerializer):
-
     project = serializers.HyperlinkedRelatedField(
         queryset=models.Project.objects.all(),
         view_name='project-detail',
@@ -1177,13 +1151,14 @@ class BaseServiceProjectLinkSerializer(PermissionFieldFilteringMixin,
         choice_mappings={v: k for k, v in core_models.SynchronizationStates.CHOICES},
         read_only=True)
 
+    service_name = serializers.ReadOnlyField(source='service.settings.name')
+
     class Meta(object):
         model = NotImplemented
-        view_name = NotImplemented
         fields = (
             'url',
             'project', 'project_name', 'project_uuid',
-            'service', 'service_name', 'service_uuid'
+            'service', 'service_uuid', 'service_name',
         )
         related_paths = ('project', 'service')
         extra_kwargs = {
@@ -1195,11 +1170,11 @@ class BaseServiceProjectLinkSerializer(PermissionFieldFilteringMixin,
 
     def validate(self, attrs):
         if attrs['service'].customer != attrs['project'].customer:
-            raise serializers.ValidationError("Service customer doesn't match project customer")
+            raise serializers.ValidationError(_("Service customer doesn't match project customer."))
 
         # XXX: Consider adding unique key (service, project) to the model instead
         if self.Meta.model.objects.filter(service=attrs['service'], project=attrs['project']).exists():
-            raise serializers.ValidationError("This service project link already exists")
+            raise serializers.ValidationError(_('This service project link already exists.'))
 
         return attrs
 
@@ -1231,23 +1206,6 @@ class ManagedResourceSerializer(BasicResourceSerializer):
     customer_name = serializers.ReadOnlyField(source='service_project_link.project.customer.name')
 
 
-class RelatedResourceSerializer(BasicResourceSerializer):
-    url = serializers.SerializerMethodField()
-    service_tags = serializers.SerializerMethodField()
-
-    def get_url(self, resource):
-        try:
-            return reverse(resource.get_url_name() + '-detail',
-                           kwargs={'uuid': resource.uuid.hex},
-                           request=self.context['request'])
-        except NoReverseMatch:
-            return None
-
-    def get_service_tags(self, resource):
-        spl = resource.service_project_link
-        return [t.name for t in spl.service.settings.tags.all()]
-
-
 class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
                              core_serializers.RestrictedSerializerMixin,
                              MonitoringSerializerMixin,
@@ -1256,8 +1214,6 @@ class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
                              serializers.HyperlinkedModelSerializer)):
 
     state = serializers.ReadOnlyField(source='get_state_display')
-    project_groups = BasicProjectGroupSerializer(
-        source='service_project_link.project.project_groups', many=True, read_only=True)
 
     project = serializers.HyperlinkedRelatedField(
         source='service_project_link.project',
@@ -1278,8 +1234,19 @@ class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
         read_only=True,
         lookup_field='uuid')
 
-    service_name = serializers.ReadOnlyField(source='service_project_link.service.name')
+    service_name = serializers.ReadOnlyField(source='service_project_link.service.settings.name')
     service_uuid = serializers.ReadOnlyField(source='service_project_link.service.uuid')
+
+    service_settings = serializers.HyperlinkedRelatedField(
+        source='service_project_link.service.settings',
+        view_name='servicesettings-detail',
+        read_only=True,
+        lookup_field='uuid')
+    service_settings_uuid = serializers.ReadOnlyField(source='service_project_link.service.settings.uuid')
+    service_settings_state = serializers.ReadOnlyField(
+        source='service_project_link.service.settings.human_readable_state')
+    service_settings_error_message = serializers.ReadOnlyField(
+        source='service_project_link.service.settings.error_message')
 
     customer = serializers.HyperlinkedRelatedField(
         source='service_project_link.project.customer',
@@ -1294,21 +1261,25 @@ class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
     created = serializers.DateTimeField(read_only=True)
     resource_type = serializers.SerializerMethodField()
 
-    tags = serializers.SerializerMethodField()
+    tags = serializers.ReadOnlyField(source='get_tags')
     access_url = serializers.SerializerMethodField()
-    related_resources = RelatedResourceSerializer(source='get_related_resources', many=True, read_only=True)
+    is_link_valid = serializers.BooleanField(
+        source='service_project_link.is_valid',
+        read_only=True,
+        help_text=_('True if resource is originated from a service that satisfies an associated project requirements.'))
 
     class Meta(object):
         model = NotImplemented
-        view_name = NotImplemented
         fields = MonitoringSerializerMixin.Meta.fields + (
             'url', 'uuid', 'name', 'description', 'start_time',
             'service', 'service_name', 'service_uuid',
+            'service_settings', 'service_settings_uuid',
+            'service_settings_state', 'service_settings_error_message',
             'project', 'project_name', 'project_uuid',
             'customer', 'customer_name', 'customer_native_name', 'customer_abbreviation',
-            'project_groups', 'tags', 'error_message',
+            'tags', 'error_message',
             'resource_type', 'state', 'created', 'service_project_link', 'backend_id',
-            'access_url', 'related_resources'
+            'access_url', 'is_link_valid',
         )
         protected_fields = ('service', 'service_project_link')
         read_only_fields = ('start_time', 'error_message', 'backend_id')
@@ -1321,17 +1292,6 @@ class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
 
     def get_resource_type(self, obj):
         return SupportedServices.get_name_for_model(obj)
-
-    def get_tags(self, obj):
-        return [t.name for t in obj.tags.all()]
-
-    def to_representation(self, instance):
-        # We need this hook, because ips have to be represented as list
-        if hasattr(instance, 'external_ips'):
-            instance.external_ips = [instance.external_ips] if instance.external_ips else []
-        if hasattr(instance, 'internal_ips'):
-            instance.internal_ips = [instance.internal_ips] if instance.internal_ips else []
-        return super(BaseResourceSerializer, self).to_representation(instance)
 
     def get_resource_fields(self):
         return self.Meta.model._meta.get_all_field_names()
@@ -1347,13 +1307,18 @@ class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
             .select_related(
                 'service_project_link',
                 'service_project_link__service',
+                'service_project_link__service__settings',
                 'service_project_link__project',
                 'service_project_link__project__customer',
-            )
-            .prefetch_related(
-                'project__project_groups',
-                'tags')
+            ).prefetch_related('service_project_link__service__settings__certifications',
+                               'service_project_link__project__certifications')
         )
+
+    def validate_service_project_link(self, service_project_link):
+        if not service_project_link.is_valid:
+            raise serializers.ValidationError(service_project_link.validation_message)
+
+        return service_project_link
 
     @transaction.atomic
     def create(self, validated_data):
@@ -1370,38 +1335,26 @@ class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
 
 
 class PublishableResourceSerializer(BaseResourceSerializer):
-
     class Meta(BaseResourceSerializer.Meta):
         fields = BaseResourceSerializer.Meta.fields + ('publishing_state',)
         read_only_fields = BaseResourceSerializer.Meta.read_only_fields + ('publishing_state',)
 
 
-class SummaryResourceSerializer(serializers.Serializer):
-
-    def to_representation(self, instance):
-        serializer = SupportedServices.get_resource_serializer(instance.__class__)
-        return serializer(instance, context=self.context).data
-
-    @staticmethod
-    def eager_load(summary_queryset):
-        optimized_querysets = []
-        for queryset in summary_queryset.querysets:
-            serializer = SupportedServices.get_resource_serializer(queryset.model)
-            optimized_querysets.append(serializer.eager_load(queryset))
-        summary_queryset.querysets = optimized_querysets
-        return summary_queryset
+class SummaryResourceSerializer(core_serializers.BaseSummarySerializer):
+    @classmethod
+    def get_serializer(cls, model):
+        return SupportedServices.get_resource_serializer(model)
 
 
-class SummaryServiceSerializer(serializers.Serializer):
-
-    def to_representation(self, instance):
-        serializer = SupportedServices.get_service_serializer(instance.__class__)
-        return serializer(instance, context=self.context).data
+class SummaryServiceSerializer(core_serializers.BaseSummarySerializer):
+    @classmethod
+    def get_serializer(cls, model):
+        return SupportedServices.get_service_serializer(model)
 
 
 class BaseResourceImportSerializer(PermissionFieldFilteringMixin,
+                                   core_serializers.AugmentedSerializerMixin,
                                    serializers.HyperlinkedModelSerializer):
-
     backend_id = serializers.CharField(write_only=True)
     project = serializers.HyperlinkedRelatedField(
         queryset=models.Project.objects.all(),
@@ -1411,13 +1364,14 @@ class BaseResourceImportSerializer(PermissionFieldFilteringMixin,
 
     state = serializers.ReadOnlyField(source='get_state_display')
     created = serializers.DateTimeField(read_only=True)
+    import_history = serializers.BooleanField(
+        default=True, write_only=True, help_text=_('Import historical resource usage.'))
 
     class Meta(object):
         model = NotImplemented
-        view_name = NotImplemented
         fields = (
             'url', 'uuid', 'name', 'state', 'created',
-            'backend_id', 'project'
+            'backend_id', 'project', 'import_history'
         )
         read_only_fields = ('name',)
         extra_kwargs = {
@@ -1429,13 +1383,16 @@ class BaseResourceImportSerializer(PermissionFieldFilteringMixin,
 
     def get_fields(self):
         fields = super(BaseResourceImportSerializer, self).get_fields()
-        fields['project'].queryset = self.context['service'].projects.all()
+        # Context doesn't have service during schema generation
+        if 'service' in self.context:
+            fields['project'].queryset = self.context['service'].projects.all()
+
         return fields
 
     def validate(self, attrs):
         if self.Meta.model.objects.filter(backend_id=attrs['backend_id']).exists():
             raise serializers.ValidationError(
-                {'backend_id': "This resource is already linked to NodeConductor"})
+                {'backend_id': _('This resource is already linked to Waldur.')})
 
         spl_class = SupportedServices.get_related_models(self.Meta.model)['service_project_link']
         spl = spl_class.objects.get(service=self.context['service'], project=attrs['project'])
@@ -1449,13 +1406,12 @@ class BaseResourceImportSerializer(PermissionFieldFilteringMixin,
 
 
 class VirtualMachineSerializer(BaseResourceSerializer):
-
     external_ips = serializers.ListField(
-        child=core_serializers.IPAddressField(),
+        child=serializers.IPAddressField(protocol='ipv4'),
         read_only=True,
     )
     internal_ips = serializers.ListField(
-        child=core_serializers.IPAddressField(),
+        child=serializers.IPAddressField(protocol='ipv4'),
         read_only=True,
     )
 
@@ -1483,9 +1439,12 @@ class VirtualMachineSerializer(BaseResourceSerializer):
 
     def get_fields(self):
         fields = super(VirtualMachineSerializer, self).get_fields()
-        if 'ssh_public_key' in fields:
-            fields['ssh_public_key'].queryset = fields['ssh_public_key'].queryset.filter(
-                user=self.context['request'].user)
+        if 'request' in self.context:
+            user = self.context['request'].user
+            ssh_public_key = fields.get('ssh_public_key')
+            if ssh_public_key:
+                ssh_public_key.query_params = {'user_uuid': user.uuid.hex}
+                ssh_public_key.queryset = ssh_public_key.queryset.filter(user=user)
         return fields
 
     def create(self, validated_data):
@@ -1497,14 +1456,15 @@ class PropertySerializerMetaclass(serializers.SerializerMetaclass):
     """ Build a list of supported properties via serializers definition.
         See SupportedServices for details.
     """
+
     def __new__(cls, name, bases, args):
         SupportedServices.register_property(args['Meta'].model)
         return super(PropertySerializerMetaclass, cls).__new__(cls, name, bases, args)
 
 
 class BasePropertySerializer(six.with_metaclass(PropertySerializerMetaclass,
-                             serializers.HyperlinkedModelSerializer)):
-
+                                                core_serializers.AugmentedSerializerMixin,
+                                                serializers.HyperlinkedModelSerializer)):
     class Meta(object):
         model = NotImplemented
 
@@ -1513,12 +1473,10 @@ class AggregateSerializer(serializers.Serializer):
     MODEL_NAME_CHOICES = (
         ('project', 'project'),
         ('customer', 'customer'),
-        ('project_group', 'project_group')
     )
     MODEL_CLASSES = {
         'project': models.Project,
         'customer': models.Customer,
-        'project_group': models.ProjectGroup,
     }
 
     aggregate = serializers.ChoiceField(choices=MODEL_NAME_CHOICES, default='customer')
@@ -1537,9 +1495,6 @@ class AggregateSerializer(serializers.Serializer):
 
         if self.data['aggregate'] == 'project':
             return queryset.all()
-        elif self.data['aggregate'] == 'project_group':
-            queryset = models.Project.objects.filter(project_groups__in=list(queryset))
-            return filter_queryset_for_user(queryset, user)
         else:
             queryset = models.Project.objects.filter(customer__in=list(queryset))
             return filter_queryset_for_user(queryset, user)
@@ -1548,3 +1503,10 @@ class AggregateSerializer(serializers.Serializer):
         projects = self.get_projects(user)
         return [model.objects.filter(project__in=projects)
                 for model in ServiceProjectLink.get_all_models()]
+
+
+class PrivateCloudSerializer(BaseResourceSerializer):
+    extra_configuration = core_serializers.JSONField(read_only=True)
+
+    class Meta(BaseResourceSerializer.Meta):
+        fields = BaseResourceSerializer.Meta.fields + ('extra_configuration',)

@@ -6,18 +6,21 @@ from __future__ import absolute_import
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 import os
 import warnings
-
 from datetime import timedelta
+
+from celery.schedules import crontab
 
 from nodeconductor.core import NodeConductorExtension
 from nodeconductor.server.admin.settings import *
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), '..'))
 
+ADMINS = ()
+
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), '..'))
 
 DEBUG = False
 
-MEDIA_ROOT = '/tmp/'
+MEDIA_ROOT = '/media_root/'
 
 MEDIA_URL = '/media/'
 
@@ -38,11 +41,12 @@ INSTALLED_APPS = (
     'nodeconductor.monitoring',
     'nodeconductor.quotas',
     'nodeconductor.structure',
-    'nodeconductor.template',
     'nodeconductor.cost_tracking',
+    'nodeconductor.users',
 
     'rest_framework',
     'rest_framework.authtoken',
+    'rest_framework_swagger',
 
     'permission',
     'django_fsm',
@@ -53,6 +57,7 @@ INSTALLED_APPS += ADMIN_INSTALLED_APPS
 
 MIDDLEWARE_CLASSES = (
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.locale.LocaleMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -70,7 +75,7 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
-    'DEFAULT_FILTER_BACKENDS': ('rest_framework.filters.DjangoFilterBackend',),
+    'DEFAULT_FILTER_BACKENDS': ('django_filters.rest_framework.DjangoFilterBackend',),
     'DEFAULT_RENDERER_CLASSES': (
         'rest_framework.renderers.JSONRenderer',
         'nodeconductor.core.renderers.BrowsableAPIRenderer',
@@ -90,6 +95,21 @@ AUTHENTICATION_BACKENDS = (
     'permission.backends.PermissionBackend',
 )
 
+AUTH_PASSWORD_VALIDATORS = [
+    {
+        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+    },
+]
+
 ANONYMOUS_USER_ID = None
 
 TEMPLATES = [
@@ -102,25 +122,33 @@ TEMPLATES = [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
-            ) + ADMIN_TEMPLATE_CONTEXT_PROCESSORS,
+                'django.template.context_processors.i18n',
+                'django.template.context_processors.media',
+                'django.template.context_processors.static',
+                'django.template.context_processors.tz',
+            ),
             'loaders': (
                 'django.template.loaders.filesystem.Loader',
                 'django.template.loaders.app_directories.Loader',
             ) + ADMIN_TEMPLATE_LOADERS,
+            'builtins': ['permission.templatetags.permissionif'],
         },
     },
-
 ]
 
 ROOT_URLCONF = 'nodeconductor.server.urls'
 
 AUTH_USER_MODEL = 'core.User'
 
+# Session
+# https://docs.djangoproject.com/en/1.8/ref/settings/#sessions
+SESSION_COOKIE_AGE = 3600
+SESSION_SAVE_EVERY_REQUEST = True
+
 WSGI_APPLICATION = 'nodeconductor.server.wsgi.application'
 
 # Internationalization
-# https://docs.djangoproject.com/en/1.6/topics/i18n/
-
+# https://docs.djangoproject.com/en/1.8/topics/i18n/
 LANGUAGE_CODE = 'en-us'
 
 TIME_ZONE = 'UTC'
@@ -129,13 +157,22 @@ USE_I18N = True
 
 USE_L10N = True
 
+LOCALE_PATHS = (
+    os.path.join(BASE_DIR, 'nodeconductor', 'locale'),
+)
+
+LANGUAGES = (
+    ('en', 'English'),
+    ('et', 'Estonian'),
+)
+
 USE_TZ = True
 
 # Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/1.6/howto/static-files/
-
+# https://docs.djangoproject.com/en/1.8/howto/static-files/
 STATIC_URL = '/static/'
 
+# Celery
 BROKER_URL = 'redis://localhost'
 CELERY_RESULT_BACKEND = 'redis://localhost'
 
@@ -146,10 +183,10 @@ CELERY_RESULT_SERIALIZER = 'json'
 CELERY_QUEUES = {
     'tasks': {'exchange': 'tasks'},
     'heavy': {'exchange': 'heavy'},
+    'background': {'exchange': 'background'},
 }
 CELERY_DEFAULT_QUEUE = 'tasks'
 CELERY_ROUTES = ('nodeconductor.server.celery.PriorityRouter',)
-
 
 CACHES = {
     'default': {
@@ -166,19 +203,23 @@ CACHES = {
 
 # Regular tasks
 CELERYBEAT_SCHEDULE = {
-
     'pull-service-settings': {
-        'task': 'nodeconductor.structure.pull_service_settings',
+        'task': 'nodeconductor.structure.ServiceSettingsListPullTask',
         'schedule': timedelta(minutes=30),
         'args': (),
     },
-
-    'update-current-month-cost-projections': {
-        'task': 'nodeconductor.cost_tracking.update_projected_estimate',
+    'check-expired-permissions': {
+        'task': 'nodeconductor.structure.check_expired_permissions',
         'schedule': timedelta(hours=24),
         'args': (),
     },
-
+    'recalculate-price-estimates': {
+        'task': 'nodeconductor.cost_tracking.recalculate_estimate',
+        # To avoid bugs and unexpected behavior - do not re-calculate estimates
+        # right in the end of the month.
+        'schedule': crontab(minute=10),
+        'args': (),
+    },
     'close-alerts-without-scope': {
         'task': 'nodeconductor.logging.close_alerts_without_scope',
         'schedule': timedelta(minutes=30),
@@ -194,8 +235,19 @@ CELERYBEAT_SCHEDULE = {
         'schedule': timedelta(minutes=30),
         'args': (),
     },
+    'cancel-expired-invitations': {
+        'task': 'nodeconductor.users.cancel_expired_invitations',
+        'schedule': timedelta(hours=24),
+        'args': (),
+    },
 }
 
+# Logging
+# Send verified request on webhook processing
+VERIFY_WEBHOOK_REQUESTS = True
+
+
+# Extensions
 NODECONDUCTOR = {
     'EXTENSIONS_AUTOREGISTER': True,
     'TOKEN_KEY': 'x-auth-token',
@@ -203,6 +255,7 @@ NODECONDUCTOR = {
 
     'SUSPEND_UNPAID_CUSTOMERS': False,
     'CLOSED_ALERTS_LIFETIME': timedelta(weeks=1),
+    'INVITATION_LIFETIME': timedelta(weeks=1),
 }
 
 
@@ -222,3 +275,20 @@ for ext in NodeConductorExtension.get_extensions():
             globals()[key] = val
 
     ext.update_settings(globals())
+
+
+# Swagger
+SWAGGER_SETTINGS = {
+    # USE_SESSION_AUTH parameter should be equal to DEBUG parameter.
+    # If it is True, LOGIN_URL and LOGOUT_URL must be specified.
+    'USE_SESSION_AUTH': False,
+    'APIS_SORTER': 'alpha',
+    'JSON_EDITOR': True,
+    'SECURITY_DEFINITIONS': {
+        'api_key': {
+            'type': 'apiKey',
+            'name': 'Authorization',
+            'in': 'header',
+        },
+    },
+}

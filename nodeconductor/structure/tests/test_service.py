@@ -1,10 +1,11 @@
-from mock_django import mock_signal_receiver
 from django.core.urlresolvers import reverse
-from rest_framework import test
+from django.db import models
+from mock_django import mock_signal_receiver
+from rest_framework import status, test
 
 from nodeconductor.structure import signals
 from nodeconductor.structure.models import Customer, CustomerRole, ProjectRole
-from nodeconductor.structure.tests import factories
+from nodeconductor.structure.tests import factories, fixtures, models as test_models
 
 
 class SuspendServiceTest(test.APITransactionTestCase):
@@ -49,13 +50,13 @@ class ServiceResourcesCounterTest(test.APITransactionTestCase):
         self.project1 = factories.ProjectFactory(customer=self.customer)
         self.project1.add_user(self.user1, ProjectRole.ADMINISTRATOR)
         self.spl1 = factories.TestServiceProjectLinkFactory(service=self.service, project=self.project1)
-        self.vm1 = factories.TestInstanceFactory(service_project_link=self.spl1)
+        self.vm1 = factories.TestNewInstanceFactory(service_project_link=self.spl1)
 
         self.user2 = factories.UserFactory()
         self.project2 = factories.ProjectFactory(customer=self.customer)
         self.project2.add_user(self.user2, ProjectRole.ADMINISTRATOR)
         self.spl2 = factories.TestServiceProjectLinkFactory(service=self.service, project=self.project2)
-        self.vm2 = factories.TestInstanceFactory(service_project_link=self.spl2)
+        self.vm2 = factories.TestNewInstanceFactory(service_project_link=self.spl2)
 
         self.service_url = factories.TestServiceFactory.get_url(self.service)
 
@@ -72,3 +73,28 @@ class ServiceResourcesCounterTest(test.APITransactionTestCase):
         self.client.force_authenticate(factories.UserFactory(is_staff=True))
         response = self.client.get(self.service_url)
         self.assertEqual(2, response.data['resources_count'])
+
+
+class UnlinkServiceTest(test.APITransactionTestCase):
+    def test_when_service_is_unlinked_all_related_resources_are_unlinked_too(self):
+        resource = factories.TestNewInstanceFactory()
+        service = resource.service_project_link.service
+        unlink_url = factories.TestServiceFactory.get_url(service, 'unlink')
+
+        self.client.force_authenticate(factories.UserFactory(is_staff=True))
+        response = self.client.post(unlink_url)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertRaises(models.ObjectDoesNotExist, service.refresh_from_db)
+
+    def test_owner_cannot_unlink_service_with_shared_settings(self):
+        fixture = fixtures.ServiceFixture()
+        service_settings = factories.ServiceSettingsFactory(shared=True)
+        service = test_models.TestService.objects.get(customer=fixture.customer, settings=service_settings)
+        unlink_url = factories.TestServiceFactory.get_url(service, 'unlink')
+        self.client.force_authenticate(fixture.owner)
+
+        response = self.client.post(unlink_url)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(test_models.TestService.objects.filter(pk=service.pk).exists())

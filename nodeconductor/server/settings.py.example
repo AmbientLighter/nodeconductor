@@ -5,12 +5,12 @@ import logging.handlers
 
 # Debugging
 # See also:
-#  - https://docs.djangoproject.com/en/1.7/ref/settings/#debug
-#  - https://docs.djangoproject.com/en/1.7/ref/settings/#template-debug
+#  - https://docs.djangoproject.com/en/1.8/ref/settings/#debug
+#  - https://docs.djangoproject.com/en/1.8/ref/settings/#template-debug
 DEBUG = False
 
 # Allowed hosts
-# See also: https://docs.djangoproject.com/en/1.7/ref/settings/#allowed-hosts
+# See also: https://docs.djangoproject.com/en/1.8/ref/settings/#allowed-hosts
 ALLOWED_HOSTS = ['127.0.0.1', 'localhost']
 
 # Secret key
@@ -19,11 +19,11 @@ ALLOWED_HOSTS = ['127.0.0.1', 'localhost']
 #
 #   head -c32 /dev/urandom | base64
 #
-# See also: https://docs.djangoproject.com/en/1.7/ref/settings/#secret-key
+# See also: https://docs.djangoproject.com/en/1.8/ref/settings/#secret-key
 SECRET_KEY = '...'
 
 # Databases
-# See also: https://docs.djangoproject.com/en/1.7/ref/settings/#databases
+# See also: https://docs.djangoproject.com/en/1.8/ref/settings/#databases
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
@@ -32,18 +32,18 @@ DATABASES = {
 }
 
 # The absolute path to the directory where collectstatic will collect static files for deployment.
-# See also: https://docs.djangoproject.com/en/1.7/ref/settings/#static-root
+# See also: https://docs.djangoproject.com/en/1.8/ref/settings/#static-root
 STATIC_ROOT = 'static'
 
 # Logging
-# See also: https://docs.djangoproject.com/en/1.7/ref/settings/#logging
+# See also: https://docs.djangoproject.com/en/1.8/ref/settings/#logging
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,  # fixes Celery beat logging
 
     # Filters
     # Filter provides additional control over which log records are passed from logger to handler.
-    # See also: https://docs.djangoproject.com/en/1.7/topics/logging/#filters
+    # See also: https://docs.djangoproject.com/en/1.8/topics/logging/#filters
     'filters': {
         # Filter out only events (user-facing messages)
         'is-event': {
@@ -57,7 +57,7 @@ LOGGING = {
 
     # Formatters
     # Formatter describes the exact format of the log entry.
-    # See also: https://docs.djangoproject.com/en/1.7/topics/logging/#formatters
+    # See also: https://docs.djangoproject.com/en/1.8/topics/logging/#formatters
     'formatters': {
         'message-only': {
             'format': '%(message)s',
@@ -69,7 +69,7 @@ LOGGING = {
 
     # Handlers
     # Handler determines what happens to each message in a logger.
-    # See also: https://docs.djangoproject.com/en/1.7/topics/logging/#handlers
+    # See also: https://docs.djangoproject.com/en/1.8/topics/logging/#handlers
     'handlers': {
         # Write logs to file
         # See also: https://docs.python.org/2/library/logging.handlers.html#watchedfilehandler
@@ -109,7 +109,7 @@ LOGGING = {
     # Loggers
     # A logger is the entry point into the logging system.
     # Each logger is a named bucket to which messages can be written for processing.
-    # See also: https://docs.djangoproject.com/en/1.7/topics/logging/#loggers
+    # See also: https://docs.djangoproject.com/en/1.8/topics/logging/#loggers
     #
     # Default logger configuration
     'root': {
@@ -118,6 +118,10 @@ LOGGING = {
     },
     # Default configuration can be overridden on per-module basis
     'loggers': {
+        # Celery loggers
+        'celery.worker': {
+            #'handlers': [],
+        },
         'django': {
             #'handlers': ['file'],
             #'level': 'WARNING',
@@ -134,8 +138,13 @@ LOGGING = {
     },
 }
 
+# Display a login/logout button on the Swagger UI
+SWAGGER_SETTINGS['USE_SESSION_AUTH'] = True
+SWAGGER_SETTINGS['LOGIN_URL'] = 'rest_framework:login'
+SWAGGER_SETTINGS['LOGOUT_URL'] = 'rest_framework:logout'
+
 # Settings, that are related to NodeCondoctor applications
-NODECONDUCTOR = {
+NODECONDUCTOR.update({
     'EXTENSIONS_AUTOREGISTER': True,
     'DEFAULT_SECURITY_GROUPS': (
         {
@@ -157,27 +166,7 @@ NODECONDUCTOR = {
             ),
         },
     ),
-    'MONITORING': {
-        'ZABBIX': {
-            'server': 'http://zabbix.example.com/zabbix',
-            'username': 'admin',
-            'password': 'zabbix',
-            'interface_parameters': {'ip': '0.0.0.0', 'main': 1, 'port': '10050', 'type': 1, 'useip': 1, 'dns': ''},
-            'templateid': '10106',
-            'groupid': '8',
-            'default_service_parameters': {'algorithm': 1, 'showsla': 1, 'sortorder': 1, 'goodsla': 95},
-            'FAIL_SILENTLY': True,
-            'HISTORY_RECORDS_INTERVAL': 60,  # time for max interval between history usage records in zabbix (in minutes)
-            'TRENDS_RECORDS_INTERVAL': 60,  # time for max interval between trends usage records in zabbix (in minutes)
-            'HISTORY_DATE_RANGE': 48,  # time interval on which zabbix will use records from history table (in hours)
-            # application-specific templates
-            'wordpress-templateid': '10107',
-            'zimbra-templateid': '10108',
-            'postgresql-templateid': '10109',
-            'application-status-item': 'application.status',
-        }
-    }
-}
+})
 
 # Example of settings for elasticsearch
 NODECONDUCTOR['ELASTICSEARCH'] = {
@@ -192,4 +181,13 @@ NODECONDUCTOR['ELASTICSEARCH'] = {
 # Set to False in order to disable this feature
 NODECONDUCTOR['ENABLE_GEOIP'] = True
 
+# Seller country code is used for computing VAT charge rate
+NODECONDUCTOR['SELLER_COUNTRY_CODE'] = 'EE'
+
 DEFAULT_FROM_EMAIL='noreply@example.com'
+
+NODECONDUCTOR['USER_COMPETENCE_LIST'] = (
+    'System administration',
+    'Project management',
+    'Software development',
+)

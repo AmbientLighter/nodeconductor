@@ -77,16 +77,22 @@ Setup
 
 .. code-block:: python
 
-    NODECONDUCTOR_ZABBIX_SMS_SETTINGS = {
-      'SMS_EMAIL_FROM': 'email',
-      'SMS_EMAIL_RCPT': 'recipient',
+
+    NODECONDUCTOR_ZABBIX = {
+        'SMS_SETTINGS': {
+            'SMS_EMAIL_FROM': 'zabbix@example.com',
+            'SMS_EMAIL_RCPT': '{phone}@example.com',
+        },
     }
+
+See also: `NodeConductor Zabbix plugin configuration <http://nodeconductor-zabbix.readthedocs.io/en/latest/installation.html#configuration>`_.
 
 2. Add Zabbix security group to all existing tenants:
 
 .. code-block:: bash
 
   nodeconductor initsecuritygroups zabbix
+  nodeconductor initsecuritygroups zabbix-agent
 
 3. Create template group:
 
@@ -128,11 +134,14 @@ Setup
    {
         "engine": "django.db.backends.mysql",
         "name": "zabbix",
-        "host": "%",
+        "host": "XXX", 
         "user": "nodeconductor",
         "password": "{{ response.user_data|bootstrap_opts:'p' }}",
         "port": "3306"
    }
+
+Parameter "host" should be specified based on environment and Zabbix image 
+configuration.
 
 
 Requests from frontend

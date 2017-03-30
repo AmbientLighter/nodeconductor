@@ -9,45 +9,50 @@
 %define __celerybeat_systemd_unit_file %{_unitdir}/%{name}-celerybeat.service
 %define __conf_file %{__conf_dir}/settings.ini
 %define __logrotate_conf_file %{__logrotate_dir}/%{name}
+%define __uwsgi_conf_file %{__conf_dir}/uwsgi.ini
+%define __uwsgi_systemd_unit_file %{_unitdir}/%{name}-uwsgi.service
 
 Name: nodeconductor
 Summary: NodeConductor
-Version: 0.101.2
+Version: 0.129.0
 Release: 1.el7
-License: Copyright 2014 OpenNode LLC.  All rights reserved.
+License: MIT
 
 # python-django-cors-headers is packaging-specific dependency; it is not required in upstream code
+# python-psycopg2 is needed to use PostgreSQL as database backend
+# python-django-appconf is needed for python-django-permission; 0.6 release does not support python-django 1.9
 Requires: logrotate
-Requires: MySQL-python
-Requires: python-celery >= 3.1.15, python-celery < 3.2
+Requires: python-celery >= 3.1.23, python-celery < 3.2
 Requires: python-croniter >= 0.3.4, python-croniter < 0.3.6
-Requires: python-django >= 1.8, python-django < 1.9
+Requires: python-django >= 1.9, python-django < 1.10
 Requires: python-django-admin-tools = 0.7.0
+Requires: python-django-appconf >= 1.0.1
 Requires: python-django-cors-headers
-Requires: python-django-filter >= 0.10
-Requires: python-django-fluent-dashboard = 0.5.1
+Requires: python-django-filter = 0.15.3
+Requires: python-django-fluent-dashboard = 0.6.1
 Requires: python-django-fsm = 2.3.0
-Requires: python-django-gm2m = 0.4.2
-Requires: python-django-model-utils = 2.2
+Requires: python-django-model-utils = 2.5.2
 Requires: python-django-permission = 0.9.2
 Requires: python-django-redis-cache >= 1.6.5
-Requires: python-django-rest-framework >= 3.1.3, python-django-rest-framework < 3.2.0
-Requires: python-django-reversion >= 1.8.7, python-django-reversion <= 1.9.3
-Requires: python-django-taggit >= 0.17.5
-Requires: python-django-uuidfield = 0.5.0
+Requires: python-django-rest-framework >= 3.5.3, python-django-rest-framework < 3.6.0
+Requires: python-django-rest-swagger = 2.1.1
+Requires: python-django-reversion >= 1.10.0, python-django-reversion <= 1.10.2
+Requires: python-django-taggit >= 0.20.2
 Requires: python-elasticsearch = 1.4.0
 Requires: python-hiredis >= 0.2.0
 Requires: python-iptools >= 0.6.1
 Requires: python-jsonfield = 1.0.0
 Requires: python-pillow >= 2.0.0
+Requires: python-psycopg2
 Requires: python-country >= 1.20, python-country < 2.0
 Requires: python-vat >= 1.3.1, python-vat < 2.0
 Requires: python-redis = 2.10.3
 Requires: python-requests >= 2.6.0
 Requires: python-sqlparse >= 0.1.11
 Requires: python-tlslite = 0.4.8
-Requires: python-urllib3 >= 1.10.1
+Requires: python-urllib3 >= 1.10.1, python-urllib3 < 1.18
 Requires: PyYAML
+Requires: uwsgi-plugin-python
 
 Source0: %{name}-%{version}.tar.gz
 
@@ -57,11 +62,13 @@ BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-buildroot
 # python-django* packages are needed to generate static files
 # python-setuptools package is needed to run 'python setup.py <cmd>'
 # systemd package provides _unitdir RPM macro
-BuildRequires: python-django >= 1.8
+BuildRequires: python-django >= 1.9, python-django < 1.10
 BuildRequires: python-django-fluent-dashboard
-BuildRequires: python-django-rest-framework >= 3.1.3, python-django-rest-framework < 3.2.0
+BuildRequires: python-django-rest-framework >= 3.5.3, python-django-rest-framework < 3.6.0
+BuildRequires: python-django-rest-swagger = 2.1.1
 BuildRequires: python-setuptools
 BuildRequires: systemd
+BuildRequires: gettext
 
 %description
 NodeConductor is an infrastructure and application management server developed by OpenNode.
@@ -71,41 +78,42 @@ NodeConductor is an infrastructure and application management server developed b
 
 %build
 cp packaging/settings.py nodeconductor/server/settings.py
+django-admin compilemessages
 %{__python} setup.py build
 
 %install
 rm -rf %{buildroot}
-python setup.py install --single-version-externally-managed -O1 --root=%{buildroot} --record=INSTALLED_FILES
+%{__python} setup.py install -O1 --root=%{buildroot}
 
 mkdir -p %{buildroot}%{_unitdir}
 cp packaging%{__celery_systemd_unit_file} %{buildroot}%{__celery_systemd_unit_file}
-echo "%{__celery_systemd_unit_file}" >> INSTALLED_FILES
 cp packaging%{__celerybeat_systemd_unit_file} %{buildroot}%{__celerybeat_systemd_unit_file}
-echo "%{__celerybeat_systemd_unit_file}" >> INSTALLED_FILES
+cp packaging%{__uwsgi_systemd_unit_file} %{buildroot}%{__uwsgi_systemd_unit_file}
 
 mkdir -p %{buildroot}%{__conf_dir}
-echo "%{__conf_dir}" >> INSTALLED_FILES
 cp packaging%{__celery_conf_file} %{buildroot}%{__celery_conf_file}
 cp packaging%{__conf_file} %{buildroot}%{__conf_file}
+cp packaging%{__uwsgi_conf_file} %{buildroot}%{__uwsgi_conf_file}
 
 mkdir -p %{buildroot}%{__data_dir}/static
-echo "%{__data_dir}" >> INSTALLED_FILES
 cat > tmp_settings.py << EOF
 # Minimal settings required for 'collectstatic' command
-INSTALLED_APPS=(
+INSTALLED_APPS = (
     'admin_tools',
     'admin_tools.dashboard',
     'admin_tools.menu',
     'admin_tools.theming',
-    'fluent_dashboard',
+    'fluent_dashboard',  # should go before 'django.contrib.admin'
+    'django.contrib.contenttypes',
     'django.contrib.admin',
     'django.contrib.staticfiles',
-    'rest_framework',
     'nodeconductor.landing',
+    'rest_framework',
+    'rest_framework_swagger',
 )
-SECRET_KEY='tmp'
-STATIC_ROOT='%{buildroot}%{__data_dir}/static'
-STATIC_URL='/static/'
+SECRET_KEY = 'tmp'
+STATIC_ROOT = '%{buildroot}%{__data_dir}/static'
+STATIC_URL = '/static/'
 TEMPLATE_CONTEXT_PROCESSORS = (
     'django.template.context_processors.request',  # required by django-admin-tools >= 0.7.0
 )
@@ -118,28 +126,32 @@ EOF
 %{__python} manage.py collectstatic --noinput --settings=tmp_settings
 
 mkdir -p %{buildroot}%{__log_dir}
-echo "%{__log_dir}" >> INSTALLED_FILES
 
 mkdir -p %{buildroot}%{__logrotate_dir}
 cp packaging%{__logrotate_conf_file} %{buildroot}%{__logrotate_conf_file}
-echo "%{__logrotate_conf_file}" >> INSTALLED_FILES
 
 mkdir -p %{buildroot}%{__work_dir}/media
-echo "%{__work_dir}" >> INSTALLED_FILES
-
-cat INSTALLED_FILES | sort | uniq > INSTALLED_FILES_CLEAN
 
 %clean
 rm -rf %{buildroot}
 
-%files -f INSTALLED_FILES_CLEAN
+%files
 %defattr(-,root,root,-)
+%{python_sitelib}/*
+%{_unitdir}/*
+%{_bindir}/*
+%{__data_dir}
+%{__log_dir}
+%{__logrotate_dir}/*
+%{__work_dir}
 %config(noreplace) %{__celery_conf_file}
 %config(noreplace) %{__conf_file}
+%config(noreplace) %{__uwsgi_conf_file}
 
 %post
 %systemd_post %{name}-celery.service
 %systemd_post %{name}-celerybeat.service
+%systemd_post %{name}-uwsgi.service
 
 if [ "$1" = 1 ]; then
     # This package is being installed for the first time
@@ -147,7 +159,11 @@ if [ "$1" = 1 ]; then
     sed -i "s,{{ secret_key }},$(head -c32 /dev/urandom | base64)," %{__conf_file}
 
     echo "[%{name}] Adding new system user %{name}..."
-    useradd --home %{__work_dir} --shell /sbin/nologin --system --user-group %{name}
+    useradd --home %{__work_dir} --shell /bin/sh --system --user-group %{name}
+elif [ "$1" = 2 ]; then
+    # This package is being upgraded
+    # Applicable to nodeconductor-0.103.0 and before
+    [ "$(getent passwd nodeconductor | cut -d: -f7)" = "/sbin/nologin" ] && usermod -s /bin/sh nodeconductor
 fi
 
 echo "[%{name}] Setting directory permissions..."
@@ -162,34 +178,33 @@ NodeConductor installed successfully.
 Next steps:
 
 1. Configure database server connection in %{__conf_file}.
-   Database server (default: MySQL) must be running already.
+   Database server (PostgreSQL) must be running already.
 
 2. Configure task queue backend connection in %{__conf_file}.
-   Key-value store (default: Redis) must be running already.
+   Key-value store (Redis) must be running already.
 
 3. Review and modify other settings in %{__conf_file}.
 
 4. Create database (if not yet done):
 
-    CREATE DATABASE nodeconductor CHARACTER SET = utf8;
-    CREATE USER 'nodeconductor'@'%' IDENTIFIED BY 'nodeconductor';
-    GRANT ALL PRIVILEGES ON nodeconductor.* to 'nodeconductor'@'%';
+     CREATE DATABASE nodeconductor ENCODING 'UTF8';
+     CREATE USER nodeconductor WITH PASSWORD 'nodeconductor';
 
 5. Migrate the database:
 
-    nodeconductor migrate --noinput
-    chown -R nodeconductor:nodeconductor /var/log/nodeconductor
+     su - nodeconductor -c "nodeconductor migrate --noinput"
 
-Note: you will need to run this again on next NodeConductor update.
+   Note: you will need to run this again on next NodeConductor update.
 
-6. Start task queue backend:
+6. Start NodeConductor services:
 
-    systemctl start nodeconductor-celery
-    systemctl start nodeconductor-celerybeat
+     systemctl start nodeconductor-celery
+     systemctl start nodeconductor-celerybeat
+     systemctl start nodeconductor-uwsgi
 
 7. Create first superuser (if needed and not yet done):
 
-    nodeconductor createsuperuser
+     su - nodeconductor -c "nodeconductor createsuperuser"
 
 All done. Happy NodeConducting!
 ------------------------------------------------------------------------
@@ -198,12 +213,158 @@ EOF
 %preun
 %systemd_preun %{name}-celery.service
 %systemd_preun %{name}-celerybeat.service
+%systemd_preun %{name}-uwsgi.service
 
 %postun
 %systemd_postun_with_restart %{name}-celery.service
 %systemd_postun_with_restart %{name}-celerybeat.service
+%systemd_postun_with_restart %{name}-uwsgi.service
 
 %changelog
+* Tue Mar 28 2017 Jenkins <jenkins@opennodecloud.com> - 0.129.0-1.el7
+- New upstream release
+
+* Wed Mar 22 2017 Jenkins <jenkins@opennodecloud.com> - 0.128.0-1.el7
+- New upstream release
+
+* Tue Mar 21 2017 Jenkins <jenkins@opennodecloud.com> - 0.127.1-1.el7
+- New upstream release
+
+* Wed Mar 15 2017 Jenkins <jenkins@opennodecloud.com> - 0.127.0-1.el7
+- New upstream release
+
+* Tue Mar 14 2017 Jenkins <jenkins@opennodecloud.com> - 0.126.2-1.el7
+- New upstream release
+
+* Tue Mar 14 2017 Jenkins <jenkins@opennodecloud.com> - 0.126.1-1.el7
+- New upstream release
+
+* Wed Mar 1 2017 Jenkins <jenkins@opennodecloud.com> - 0.126.0-1.el7
+- New upstream release
+
+* Mon Feb 27 2017 Jenkins <jenkins@opennodecloud.com> - 0.125.0-1.el7
+- New upstream release
+
+* Sat Feb 18 2017 Jenkins <jenkins@opennodecloud.com> - 0.124.0-1.el7
+- New upstream release
+
+* Fri Feb 10 2017 Jenkins <jenkins@opennodecloud.com> - 0.123.0-1.el7
+- New upstream release
+
+* Wed Feb 8 2017 Jenkins <jenkins@opennodecloud.com> - 0.122.0-1.el7
+- New upstream release
+
+* Tue Feb 7 2017 Jenkins <jenkins@opennodecloud.com> - 0.121.1-1.el7
+- New upstream release
+
+* Mon Feb 6 2017 Jenkins <jenkins@opennodecloud.com> - 0.121.0-1.el7
+- New upstream release
+
+* Thu Feb 2 2017 Jenkins <jenkins@opennodecloud.com> - 0.120.0-1.el7
+- New upstream release
+
+* Wed Jan 25 2017 Jenkins <jenkins@opennodecloud.com> - 0.119.1-1.el7
+- New upstream release
+
+* Tue Jan 24 2017 Jenkins <jenkins@opennodecloud.com> - 0.119.0-1.el7
+- New upstream release
+
+* Thu Jan 19 2017 Jenkins <jenkins@opennodecloud.com> - 0.118.0-1.el7
+- New upstream release
+
+* Tue Jan 17 2017 Jenkins <jenkins@opennodecloud.com> - 0.117.0-1.el7
+- New upstream release
+
+* Fri Jan 13 2017 Jenkins <jenkins@opennodecloud.com> - 0.116.0-1.el7
+- New upstream release
+
+* Wed Jan 4 2017 Jenkins <jenkins@opennodecloud.com> - 0.115.0-1.el7
+- New upstream release
+
+* Tue Jan 3 2017 Jenkins <jenkins@opennodecloud.com> - 0.114.0-1.el7
+- New upstream release
+
+* Fri Dec 30 2016 Jenkins <jenkins@opennodecloud.com> - 0.113.1-1.el7
+- New upstream release
+
+* Fri Dec 30 2016 Jenkins <jenkins@opennodecloud.com> - 0.113.0-1.el7
+- New upstream release
+
+* Tue Dec 27 2016 Jenkins <jenkins@opennodecloud.com> - 0.112.1-1.el7
+- New upstream release
+
+* Fri Dec 23 2016 Jenkins <jenkins@opennodecloud.com> - 0.112.0-1.el7
+- New upstream release
+
+* Fri Dec 16 2016 Juri Hudolejev <juri@opennodecloud.com> - 0.111.0-2.el7
+- Drop MySQL and SQLite3 database backend support
+
+* Wed Dec 14 2016 Jenkins <jenkins@opennodecloud.com> - 0.111.0-1.el7
+- New upstream release
+
+* Fri Nov 11 2016 Jenkins <jenkins@opennodecloud.com> - 0.110.0-1.el7
+- New upstream release
+
+* Wed Oct 26 2016 Jenkins <jenkins@opennodecloud.com> - 0.109.0-1.el7
+- New upstream release
+
+* Mon Oct 10 2016 Jenkins <jenkins@opennodecloud.com> - 0.108.3-1.el7
+- New upstream release
+
+* Fri Oct 7 2016 Jenkins <jenkins@opennodecloud.com> - 0.108.2-1.el7
+- New upstream release
+
+* Tue Sep 27 2016 Jenkins <jenkins@opennodecloud.com> - 0.108.1-1.el7
+- New upstream release
+
+* Tue Sep 27 2016 Jenkins <jenkins@opennodecloud.com> - 0.108.0-1.el7
+- New upstream release
+
+* Thu Sep 15 2016 Jenkins <jenkins@opennodecloud.com> - 0.107.1-1.el7
+- New upstream release
+
+* Thu Sep 15 2016 Jenkins <jenkins@opennodecloud.com> - 0.107.0-1.el7
+- New upstream release
+
+* Tue Sep 13 2016 Jenkins <jenkins@opennodecloud.com> - 0.106.0-1.el7
+- New upstream release
+
+* Fri Sep 2 2016 Jenkins <jenkins@opennodecloud.com> - 0.105.0-2.el7
+- Add uWSGI as WSGI runner
+
+* Wed Aug 31 2016 Jenkins <jenkins@opennodecloud.com> - 0.105.0-1.el7
+- New upstream release
+
+* Thu Aug 18 2016 Jenkins <jenkins@opennodecloud.com> - 0.104.1-1.el7
+- New upstream release
+
+* Sun Aug 14 2016 Jenkins <jenkins@opennodecloud.com> - 0.104.0-1.el7
+- New upstream release
+
+* Fri Jul 15 2016 Jenkins <jenkins@opennodecloud.com> - 0.103.0-1.el7
+- New upstream release
+
+* Wed Jul 6 2016 Jenkins <jenkins@opennodecloud.com> - 0.102.5-1.el7
+- New upstream release
+
+* Mon Jul 4 2016 Jenkins <jenkins@opennodecloud.com> - 0.102.4-1.el7
+- New upstream release
+
+* Thu Jun 30 2016 Jenkins <jenkins@opennodecloud.com> - 0.102.3-1.el7
+- New upstream release
+
+* Wed Jun 29 2016 Jenkins <jenkins@opennodecloud.com> - 0.102.2-1.el7
+- New upstream release
+
+* Mon Jun 27 2016 Jenkins <jenkins@opennodecloud.com> - 0.102.1-1.el7
+- New upstream release
+
+* Wed Jun 22 2016 Jenkins <jenkins@opennodecloud.com> - 0.102.0-1.el7
+- New upstream release
+
+* Thu Jun 16 2016 Jenkins <jenkins@opennodecloud.com> - 0.101.3-1.el7
+- New upstream release
+
 * Tue Jun 14 2016 Jenkins <jenkins@opennodecloud.com> - 0.101.2-1.el7
 - New upstream release
 

@@ -3,8 +3,8 @@ from __future__ import unicode_literals
 from django.conf import settings
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
-import rest_framework.authentication
 from rest_framework import exceptions
+import rest_framework.authentication
 
 import nodeconductor.logging.middleware
 
@@ -26,17 +26,20 @@ class TokenAuthentication(rest_framework.authentication.TokenAuthentication):
         return auth
 
     def authenticate_credentials(self, key):
+        model = self.get_model()
         try:
-            token = self.model.objects.select_related('user').get(key=key)
-        except self.model.DoesNotExist:
+            token = model.objects.select_related('user').get(key=key)
+        except model.DoesNotExist:
             raise exceptions.AuthenticationFailed(_('Invalid token.'))
 
         if not token.user.is_active:
             raise exceptions.AuthenticationFailed(_('User inactive or deleted.'))
 
-        lifetime = settings.NODECONDUCTOR.get('TOKEN_LIFETIME', timezone.timedelta(hours=1))
-        if token.created < timezone.now() - lifetime:
-            raise exceptions.AuthenticationFailed(_('Token has expired.'))
+        if token.user.token_lifetime:
+            lifetime = timezone.timedelta(seconds=token.user.token_lifetime)
+
+            if token.created < timezone.now() - lifetime:
+                raise exceptions.AuthenticationFailed(_('Token has expired.'))
 
         return token.user, token
 
@@ -53,7 +56,13 @@ class TokenAuthentication(rest_framework.authentication.TokenAuthentication):
             msg = _('Invalid token. Token string should not contain spaces.')
             raise exceptions.AuthenticationFailed(msg)
 
-        return self.authenticate_credentials(auth[1])
+        try:
+            token = auth[1].decode()
+        except UnicodeError:
+            msg = _('Invalid token header. Token string should not contain invalid characters.')
+            raise exceptions.AuthenticationFailed(msg)
+
+        return self.authenticate_credentials(token)
 
 
 def user_capturing_auth(auth):

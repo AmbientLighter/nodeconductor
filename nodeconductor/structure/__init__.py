@@ -26,7 +26,7 @@ class SupportedServices(object):
             'gitlab': {
                 'name': 'GitLab',
                 'model_name': 'gitlab.gitlabservice',
-                'backend': nodeconductor_plus.gitlab.backend.GitLabBackend,
+                'backend': nodeconductor_gitlab.backend.GitLabBackend,
                 'detail_view': 'gitlab-detail',
                 'list_view': 'gitlab-list',
                 'properties': {},
@@ -214,19 +214,6 @@ class SupportedServices(object):
         return cls._registry[key]['resources'][model_str]['view']
 
     @classmethod
-    def get_resource_actions(cls, model):
-        from nodeconductor.core.utils import sort_dict
-
-        view = cls.get_resource_view(model)
-        actions = {}
-        for key in dir(view):
-            attr = getattr(view, key)
-            if hasattr(attr, 'bind_to_methods') and 'post' in attr.bind_to_methods:
-                actions[key] = attr
-        actions['destroy'] = view.destroy
-        return sort_dict(actions)
-
-    @classmethod
     def get_services_with_resources(cls, request=None):
         """ Get a list of services and resources endpoints.
             {
@@ -247,7 +234,7 @@ class SupportedServices(object):
         data = {}
         for service in cls._registry.values():
             service_model = apps.get_model(service['model_name'])
-            service_project_link = cls.get_service_project_link(service_model)
+            service_project_link = service_model.projects.through
             service_project_link_url = reverse(cls.get_list_view_for_model(service_project_link), request=request)
 
             data[service['name']] = {
@@ -268,11 +255,11 @@ class SupportedServices(object):
             {
                 ...
                 'gitlab': {
-                    "service": nodeconductor_plus.gitlab.models.GitLabService,
-                    "service_project_link": nodeconductor_plus.gitlab.models.GitLabServiceProjectLink,
+                    "service": nodeconductor_gitlab.models.GitLabService,
+                    "service_project_link": nodeconductor_gitlab.models.GitLabServiceProjectLink,
                     "resources": [
-                        nodeconductor_plus.gitlab.models.Group,
-                        nodeconductor_plus.gitlab.models.Project
+                        nodeconductor_gitlab.models.Group,
+                        nodeconductor_gitlab.models.Project
                     ],
                 },
                 ...
@@ -284,7 +271,7 @@ class SupportedServices(object):
         data = {}
         for key, service in cls._registry.items():
             service_model = apps.get_model(service['model_name'])
-            service_project_link = cls.get_service_project_link(service_model)
+            service_project_link = service_model.projects.through
             data[key] = {
                 'service': service_model,
                 'service_project_link': service_project_link,
@@ -295,18 +282,13 @@ class SupportedServices(object):
         return data
 
     @classmethod
-    def get_service_project_link(cls, service_model):
-        return next(m.related_model for m in service_model._meta.get_all_related_objects()
-                    if m.name.endswith('serviceprojectlink'))
-
-    @classmethod
     @lru_cache(maxsize=1)
     def get_resource_models(cls):
         """ Get a list of resource models.
             {
                 'DigitalOcean.Droplet': nodeconductor_plus.digitalocean.models.Droplet,
-                'GitLab.Group': nodeconductor_plus.gitlab.models.Group,
-                'GitLab.Project': nodeconductor_plus.gitlab.models.Project,
+                'GitLab.Group': nodeconductor_gitlab.models.Group,
+                'GitLab.Project': nodeconductor_gitlab.models.Project,
                 'Oracle.Database': nodeconductor_oracle_dbaas.models.Database
             }
 
@@ -353,11 +335,11 @@ class SupportedServices(object):
 
             >> SupportedServices.get_related_models(gitlab_models.Project)
             {
-                'service': nodeconductor_plus.gitlab.models.GitLabService,
-                'service_project_link': nodeconductor_plus.gitlab.models.GitLabServiceProjectLink,
+                'service': nodeconductor_gitlab.models.GitLabService,
+                'service_project_link': nodeconductor_gitlab.models.GitLabServiceProjectLink,
                 'resources': [
-                    nodeconductor_plus.gitlab.models.Group,
-                    nodeconductor_plus.gitlab.models.Project,
+                    nodeconductor_gitlab.models.Group,
+                    nodeconductor_gitlab.models.Project,
                 ]
             }
         """
@@ -445,17 +427,10 @@ def log_backend_action(action=None):
             action_name = func.func_name.replace('_', ' ') if action is None else action
 
             logger.debug('About to %s `%s` (PK: %s).', action_name, instance, instance.pk)
-            try:
-                result = func(self, instance, *args, **kwargs)
-            except ServiceBackendError:
-                logger.error('Failed to %s `%s` (PK: %s).', action_name, instance, instance.pk)
-                exc = list(sys.exc_info())
-                exc[0] = ServiceBackendError
-                six.reraise(*exc)
-            else:
-                logger.debug('Action `%s` was executed successfully for `%s` (PK: %s).',
-                             action_name, instance, instance.pk)
-                return result
+            result = func(self, instance, *args, **kwargs)
+            logger.debug('Action `%s` was executed successfully for `%s` (PK: %s).',
+                         action_name, instance, instance.pk)
+            return result
         return wrapped
     return decorator
 
@@ -497,18 +472,6 @@ class ServiceBackend(object):
         raise ServiceBackendNotImplemented
 
     def restart(self, resource):
-        raise ServiceBackendNotImplemented
-
-    def add_ssh_key(self, ssh_key, service_project_link):
-        raise ServiceBackendNotImplemented
-
-    def remove_ssh_key(self, ssh_key, service_project_link):
-        raise ServiceBackendNotImplemented
-
-    def add_user(self, user, service_project_link):
-        raise ServiceBackendNotImplemented
-
-    def remove_user(self, user, service_project_link):
         raise ServiceBackendNotImplemented
 
     def get_resources_for_import(self):

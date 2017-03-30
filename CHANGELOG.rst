@@ -3,7 +3,260 @@ CHANGELOG
 
 Release NEXT
 ------------
-Nothing yet.
+- Enable i18n.
+
+Release 0.129.0
+---------------
+- Reorganize admin dashboard. Add links to shared settings and resources.
+- Introduce SubResources concept.
+- Remove old style Resource.
+
+Release 0.128.0
+---------------
+- Allow customer to limit project services by certificates.
+- Add validation state and message to resources.
+- Forbid resource creation is service project link is created from a service that does not satisfy project requirements.
+
+Release 0.127.1
+---------------
+- Render token for the current user.
+
+Release 0.127.0
+---------------
+- Disable service setting name update via service endpoint.
+
+Release 0.126.2
+---------------
+- Fix settings fields values overlap issue on settings creation.
+
+Release 0.126.1
+---------------
+- Validate role expiration time for permission granting user.
+- Fix settings name update through service name update.
+
+Release 0.126.0
+---------------
+- Migrate to Django 1.9
+- Add minimum schedule value validator.
+Now it is possible to set minimum time frame for resource schedule operations.
+- Drop django-gm2m dependency.
+- Replace django.conf.urls.patterns with list of urls.
+- Allow to define geolocation for service settings.
+
+Release 0.125.0
+---------------
+- Change external and internal ips to property. Force all models inherited from VirtualMachineMixin to define external
+and internal ips properties.
+- Remove name from service, service settings name is used instead.
+- Introduce and connect certification model to service settings.
+
+Release 0.124.0
+---------------
+- Logging cleanup.
+- Limit admin session life time to 1h by default, made it configurable.
+- Implemented penalized background task for reducing load from polling of services in down state.
+
+Release 0.123.0
+---------------
+- Allow user to define his token lifetime.
+- On update, instance is not returned in the old state anymore.
+- Move throttling tasks from openstack plugin into structure.
+
+Release 0.122.0
+---------------
+- Add field "domain" to service settings.
+
+Release 0.121.1
+---------------
+- Make actions metadata renderer more generic so that it can be used for support offering.
+- Allow to order customer and project users by concatenated name.
+- Improve Swagger schema generator.
+
+Release 0.121.0
+---------------
+- Display customer as "organization" in /admin.
+- Allow user to grant new role and set expiration time simultaneously.
+
+Release 0.120.0
+---------------
+- Allow user to be in any role simultaneously.
+- Merge BaseResourceStateFilter with BaseResourceFilter and remove BaseResourceStateFilter.
+- Fix permission deletion by making is_active field nullable.
+
+Release 0.119.1
+---------------
+- Fix customer permission visibility issue.
+
+Release 0.119.0
+---------------
+- Fix token authentication according to DRF 3.3.
+- Replace IPAddressField serializer with DRF serializer.
+- Add get_extra_kwargs method to AugmentedSerializerMixin.
+- Migrate to DRF 3.5.3 and django_filter 0.15.3.
+- Drop DjangoMappingFilterBackend and UUIDFilter.
+
+Release 0.118.0
+---------------
+- Check if user has already accepted terms of service when he updates profile.
+
+Release 0.117.0
+---------------
+- Show user description only to staff users.
+
+Release 0.116.0
+---------------
+- Fix ProjectAdminForm.
+- Drop UpdateOnlyStableMixin and UserContextMixin.
+- Fix projects' get_users method.
+- Add is_support field to User model.
+- Add Support role to project and customer roles.
+- Enable filtering user by customer and project UUID.
+
+Release 0.115.0
+---------------
+- Add RuntimeStateValidator
+- Fix access permissions.
+
+Release 0.114.0
+---------------
+- Drop project groups.
+- Implement permission mixin, project and customer permissions.
+- Implement ability to set role deprecation time.
+- Implement endpoint to get history of authorized personnel by period.
+
+Release 0.113.1
+---------------
+- Fix ActionsMetadata.
+
+Release 0.113.0
+---------------
+- Fix ActionsViewSet.
+- Implement ResourceViewSet.
+
+Release 0.112.1
+---------------
+- Implement ActionsViewSet and ActionsPermision.
+
+Release 0.112.0
+---------------
+- Drop MySQL and SQLite3 database backend support.
+- Remove SerializableAbstractMixin for serialization and reuse core.utils instead.
+
+Release 0.111.0
+---------------
+- Added missing resource events.
+- Fixed lookup and grouping of event groups.
+- Allow staff to filter customer by user UUID.
+
+Release 0.110.0
+---------------
+- Added agreement_date field to User model.
+- Extended resources privileges for project managers.
+
+Release 0.109.0
+---------------
+- Introduced user invitations.
+- Add "registration_method" field to user model.
+
+Release 0.108.3
+---------------
+- Introduce new abstract model Storage.
+
+Release 0.108.2
+---------------
+- Fix filtering price estimate by customer UUID.
+- Use separate queue for background tasks.
+- Fix service settings sync task.
+- Refactor PrivateCloudMixin -> PrivateCloud abstract model.
+- Allow to use custom responses with @safe_operation decorator.
+
+Release 0.108.1
+---------------
+- Don't use urllib3 1.18 because it's not compatible with old setuptools.
+
+Release 0.108.0
+---------------
+- Introduction of usage-based price estimatation and billing.
+- Prohibit editting of price estimates manually.
+- Preserve consumption details of resources.
+- Refactor price estimates calculation for link and unlink operations.
+- Remove "resource provisioned" signal.
+- Add admin action for recalculation of price estimates.
+- Display resource consumption details in admin.
+- Introduce base class for background tasks.
+
+Release 0.107.1
+---------------
+- Bumped django-model-utils dependency version to 2.5.2.
+
+Release 0.107.0
+---------------
+- Migrated to Django 1.8 UUIDField.
+
+Release 0.106.0
+---------------
+- Validate UUID in filters.
+
+Release 0.105.0
+---------------
+- Fix scoped service settings descendant resource unlinking.
+- Enable HTTP client debugging.
+
+Release 0.104.1
+---------------
+- Revert damage to /admin (upgrade strongly suggested).
+
+Release 0.104.0
+---------------
+- Render actions metadata for new resources.
+- Historical resource calculation is made optional.
+- Fix Sentry integration.
+- Implemented unlinking provider with all resources.
+- Expose creation time of resources in /admin.
+- Make service models quota-aware.
+- Silence failed sync actions if resources was already erred.
+
+Release 0.103.0
+---------------
+- Remove specific signals that handles user/ssh key management.
+- Implement management command to cleanup invalid price estimates.
+- Update metadata for price estimates of service, settings and project on scope deletion.
+- Allow to update push hook token.
+- Implement mixins to specify extra field metadata.
+
+Release 0.102.5
+---------------
+- Removed incorrect wrapper.
+
+Release 0.102.4
+---------------
+- Fix OpenStack client exception serialization in log_backend_action.
+
+Release 0.102.3
+---------------
+- Rename PaidResource to PayableMixin. Track PriceEstimate for PayableMixin.
+- Allow executing custom actions via templates after provision.
+
+Release 0.102.2
+---------------
+- Cache resources and services tags.
+- Allow to inject extra actions into model admin.
+
+Release 0.102.1
+---------------
+- Introduce StructureLoggableMixin for filtering permitted object UUIDs.
+
+Release 0.102.0
+---------------
+- Introduce VAT persistence and handling for customers.
+
+Release 0.101.3
+---------------
+- Speedup services and resources load time.
+- Provide view mixin for eager load.
+- Add support for subscription to event groups.
+- Fix service settings change view.
+- Fix Travis build and documentation generation for plugin.
 
 Release 0.101.2
 ---------------

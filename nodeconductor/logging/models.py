@@ -16,13 +16,14 @@ from django.utils import timezone
 from jsonfield import JSONField
 from model_utils.models import TimeStampedModel
 import requests
-from uuidfield import UUIDField
 
+from nodeconductor.core.fields import UUIDField
 from nodeconductor.core.utils import timestamp_to_datetime
 from nodeconductor.logging import managers
 
 
 logger = logging.getLogger(__name__)
+
 
 class UuidMixin(models.Model):
     # There is circular dependency between logging and core applications.
@@ -31,7 +32,7 @@ class UuidMixin(models.Model):
     class Meta:
         abstract = True
 
-    uuid = UUIDField(auto=True, unique=True)
+    uuid = UUIDField()
 
 
 class Alert(UuidMixin, TimeStampedModel):
@@ -169,11 +170,11 @@ class WebHook(BaseHook):
 
         # encode event as JSON
         if self.content_type == WebHook.ContentTypeChoices.JSON:
-            requests.post(self.destination_url, json=event, verify=False)
+            requests.post(self.destination_url, json=event, verify=settings.VERIFY_WEBHOOK_REQUESTS)
 
         # encode event as form
         elif self.content_type == WebHook.ContentTypeChoices.FORM:
-            requests.post(self.destination_url, data=event, verify=False)
+            requests.post(self.destination_url, data=event, verify=settings.VERIFY_WEBHOOK_REQUESTS)
 
 
 class PushHook(BaseHook):
@@ -221,16 +222,17 @@ class PushHook(BaseHook):
         }
         payload = {
             'to': self.token,
-            "notification": {
-                "body": event.get('message', 'New event'),
-                "title": conf.get('NOTIFICATION_TITLE', 'NodeConductor notification'),
-                "image": "icon",
+            'notification': {
+                'body': event.get('message', 'New event'),
+                'title': conf.get('NOTIFICATION_TITLE', 'NodeConductor notification'),
+                'image': 'icon',
             },
             'data': {
                 'event': event
             },
         }
-
+        if self.type == self.Type.IOS:
+            payload['content-available'] = '1'
         logger.debug('Submitting GCM push notification with headers %s, payload: %s' % (headers, payload))
         requests.post(endpoint, json=payload, headers=headers)
 

@@ -1,52 +1,10 @@
 from __future__ import unicode_literals
 
-from rest_framework import mixins, status, response
+from django.utils.translation import ugettext_lazy as _
+from rest_framework import status, response
 
 from nodeconductor.core import models
 from nodeconductor.core.exceptions import IncorrectStateException
-
-
-class ListModelMixin(mixins.ListModelMixin):
-    def __init__(self, *args, **kwargs):
-        import warnings
-
-        warnings.warn(
-            "nodeconductor.core.mixins.ListModelMixin is deprecated. "
-            "Use stock rest_framework.mixins.ListModelMixin instead.",
-            DeprecationWarning,
-        )
-
-        super(ListModelMixin, self).__init__(*args, **kwargs)
-
-
-class UpdateOnlyStableMixin(object):
-    """
-    Allow modification of entities in stable state only.
-    """
-
-    def initial(self, request, *args, **kwargs):
-        acceptable_states = {
-            'update': models.SynchronizationStates.STABLE_STATES,
-            'partial_update': models.SynchronizationStates.STABLE_STATES,
-            'destroy': models.SynchronizationStates.STABLE_STATES | {models.SynchronizationStates.NEW},
-        }
-        if self.action in acceptable_states.keys():
-            obj = self.get_object()
-            if obj and isinstance(obj, models.SynchronizableMixin):
-                if obj.state not in acceptable_states[self.action]:
-                    raise IncorrectStateException(
-                        'Modification allowed in stable states only.')
-
-        return super(UpdateOnlyStableMixin, self).initial(request, *args, **kwargs)
-
-
-class UserContextMixin(object):
-    """ Pass current user to serializer context """
-
-    def get_serializer_context(self):
-        context = super(UserContextMixin, self).get_serializer_context()
-        context['user'] = self.request.user
-        return context
 
 
 class StateMixin(object):
@@ -66,30 +24,26 @@ class StateMixin(object):
         if acceptable_state:
             obj = self.get_object()
             if obj.state not in acceptable_state:
-                raise IncorrectStateException('Modification allowed in stable states only.')
+                raise IncorrectStateException(_('Modification allowed in stable states only.'))
 
         return super(StateMixin, self).initial(request, *args, **kwargs)
 
 
+# deprecated
 class RuntimeStateMixin(object):
     runtime_acceptable_states = {}
 
     def initial(self, request, *args, **kwargs):
-        States = models.RuntimeStateMixin.RuntimeStates
-        acceptable_states = {
-            'stop': States.ONLINE,
-            'start': States.OFFLINE,
-            'restart': States.ONLINE,
-        }
-        acceptable_states.update(self.runtime_acceptable_states)
-        acceptable_state = acceptable_states.get(self.action)
+        if self.action in self.runtime_acceptable_states:
+            self.check_operation(request, self.get_object(), self.action)
+        return super(RuntimeStateMixin, self).initial(request, *args, **kwargs)
+
+    def check_operation(self, request, obj, action):
+        acceptable_state = self.runtime_acceptable_states.get(action)
         if acceptable_state:
-            obj = self.get_object()
             if obj.state != models.StateMixin.States.OK or obj.runtime_state != acceptable_state:
                 raise IncorrectStateException(
-                    'Performing %s operation is not allowed for resource in its current state.' % self.action)
-
-        return super(RuntimeStateMixin, self).initial(request, *args, **kwargs)
+                    _('Performing %s operation is not allowed for resource in its current state.') % action)
 
 
 class AsyncExecutor(object):
@@ -118,7 +72,7 @@ class UpdateExecutorMixin(AsyncExecutor):
         instance.refresh_from_db()
         updated_fields = {f.name for f, v in before_update_fields.items() if v != getattr(instance, f.attname)}
         self.update_executor.execute(instance, async=self.async_executor, updated_fields=updated_fields)
-        instance.refresh_from_db()
+        serializer.instance.refresh_from_db()
 
 
 class DeleteExecutorMixin(AsyncExecutor):
@@ -129,7 +83,12 @@ class DeleteExecutorMixin(AsyncExecutor):
         self.delete_executor.execute(
             instance, async=self.async_executor, force=instance.state == models.StateMixin.States.ERRED)
         return response.Response(
-            {'detail': 'Deletion was scheduled'}, status=status.HTTP_202_ACCEPTED)
+            {'detail': _('Deletion was scheduled.')}, status=status.HTTP_202_ACCEPTED)
+
+
+class ExecutorMixin(CreateExecutorMixin, UpdateExecutorMixin, DeleteExecutorMixin):
+    """ Executer create/update/delete operation with executor """
+    pass
 
 
 class EagerLoadMixin(object):

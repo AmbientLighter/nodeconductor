@@ -3,7 +3,7 @@ import factory
 from django.core.urlresolvers import reverse
 from django.contrib.contenttypes.models import ContentType
 
-from nodeconductor.cost_tracking import models
+from nodeconductor.cost_tracking import models, CostTrackingStrategy, ConsumableItem
 from nodeconductor.structure.tests import models as test_models
 from nodeconductor.structure.tests import factories as structure_factories
 
@@ -29,6 +29,13 @@ class PriceEstimateFactory(factory.DjangoModelFactory):
         return url if action is None else url + action + '/'
 
 
+class ConsumptionDetailsFactory(factory.DjangoModelFactory):
+    class Meta:
+        model = models.ConsumptionDetails
+
+    price_estimate = factory.SubFactory(PriceEstimateFactory)
+
+
 class AbstractPriceListItemFactory(factory.DjangoModelFactory):
     class Meta(object):
         model = models.AbstractPriceListItem
@@ -43,7 +50,7 @@ class DefaultPriceListItemFactory(AbstractPriceListItemFactory):
         model = models.DefaultPriceListItem
 
     resource_content_type = factory.LazyAttribute(
-        lambda _: ContentType.objects.get_for_model(test_models.TestInstance))
+        lambda _: ContentType.objects.get_for_model(test_models.TestNewInstance))
 
     key = factory.Sequence(lambda n: 'price list item %s' % n)
     item_type = factory.Iterator(['flavor', 'storage'])
@@ -78,3 +85,45 @@ class PriceListItemFactory(AbstractPriceListItemFactory):
             price_list_item = PriceListItemFactory()
         url = 'http://testserver' + reverse('pricelistitem-detail', kwargs={'uuid': price_list_item.uuid})
         return url if action is None else url + action + '/'
+
+
+class TestNewInstanceCostTrackingStrategy(CostTrackingStrategy):
+    resource_class = test_models.TestNewInstance
+
+    class Types(object):
+        STORAGE = 'storage'
+        RAM = 'ram'
+        CORES = 'cores'
+        QUOTAS = 'quotas'
+        FLAVOR = 'flavor'
+
+    @classmethod
+    def get_configuration(cls, resource):
+        States = test_models.TestNewInstance.States
+        if resource.state == States.ERRED:
+            return {}
+        resource_quota_usage = resource.quotas.get(name=test_models.TestNewInstance.Quotas.test_quota).usage
+        consumables = {
+            ConsumableItem(item_type=cls.Types.STORAGE, key='1 MB'): resource.disk,
+            ConsumableItem(item_type=cls.Types.QUOTAS, key='test_quota'): resource_quota_usage,
+        }
+        if resource.runtime_state == 'online':
+            consumables.update({
+                ConsumableItem(item_type=cls.Types.RAM, key='1 MB'): resource.ram,
+                ConsumableItem(item_type=cls.Types.CORES, key='1 core'): resource.cores,
+            })
+        if resource.flavor_name:
+            consumables[ConsumableItem(item_type=cls.Types.FLAVOR, key=resource.flavor_name)] = 1
+        return consumables
+
+    @classmethod
+    def get_consumable_items(cls):
+        return [
+            ConsumableItem(cls.Types.STORAGE, "1 MB", units='MB', name='Storage'),
+            ConsumableItem(cls.Types.RAM, "1 MB", units='MB', name='RAM', default_price=1),
+            ConsumableItem(cls.Types.CORES, "1 core", name='Cores'),
+            ConsumableItem(cls.Types.QUOTAS, "test_quota", name='Test quota'),
+            ConsumableItem(cls.Types.FLAVOR, "small", name='Small flavor'),
+            ConsumableItem(cls.Types.FLAVOR, "medium", name='Medium flavor'),
+            ConsumableItem(cls.Types.FLAVOR, "large", name='Large flavor'),
+        ]

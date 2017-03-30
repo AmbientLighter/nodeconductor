@@ -1,8 +1,8 @@
 from __future__ import unicode_literals
 
+import functools
 import time
 import logging
-import functools
 from collections import defaultdict
 
 from datetime import timedelta
@@ -13,10 +13,12 @@ from django.db import transaction, IntegrityError
 from django.db.models import Q
 from django.http import Http404
 from django.utils import six, timezone
+from django.utils.functional import cached_property
+from django.utils.translation import ugettext_lazy as _
 from django.views.static import serve
+from django_filters.rest_framework import DjangoFilterBackend
 from django_fsm import TransitionNotAllowed
 
-from rest_framework import filters as rf_filters
 from rest_framework import mixins
 from rest_framework import permissions as rf_permissions
 from rest_framework import serializers as rf_serializers
@@ -27,27 +29,21 @@ from rest_framework import generics
 from rest_framework.decorators import detail_route, list_route
 from rest_framework.exceptions import PermissionDenied, MethodNotAllowed, NotFound, APIException, ValidationError
 from rest_framework.response import Response
-import reversion
+from reversion import revisions as reversion
 
-from nodeconductor.core import filters as core_filters
-from nodeconductor.core import mixins as core_mixins
-from nodeconductor.core import models as core_models
-from nodeconductor.core import exceptions as core_exceptions
-from nodeconductor.core import serializers as core_serializers
-from nodeconductor.core.views import StateExecutorViewSet
+from nodeconductor.core import (
+    filters as core_filters, mixins as core_mixins, models as core_models, exceptions as core_exceptions,
+    serializers as core_serializers, views as core_views, validators as core_validators)
 from nodeconductor.core.utils import request_api, datetime_to_timestamp, sort_dict
 from nodeconductor.monitoring.filters import SlaFilter, MonitoringItemFilter
 from nodeconductor.quotas.models import QuotaModelMixin, Quota
-from nodeconductor.structure import SupportedServices, ServiceBackendError, ServiceBackendNotImplemented
-from nodeconductor.structure import filters
-from nodeconductor.structure import permissions
-from nodeconductor.structure import models
-from nodeconductor.structure import serializers
-from nodeconductor.structure import managers
+from nodeconductor.structure import (
+    SupportedServices, ServiceBackendError, ServiceBackendNotImplemented, filters, permissions, models, serializers,
+    managers)
 from nodeconductor.structure.log import event_logger
 from nodeconductor.structure.signals import resource_imported
 from nodeconductor.structure.managers import filter_queryset_for_user
-from nodeconductor.structure.metadata import check_operation, ResourceActionsMetadata
+from nodeconductor.structure.metadata import check_operation, ActionsMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +56,7 @@ class CustomerViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
     lookup_field = 'uuid'
     permission_classes = (rf_permissions.IsAuthenticated,
                           rf_permissions.DjangoObjectPermissions)
-    filter_backends = (filters.GenericRoleFilter, rf_filters.DjangoFilterBackend,)
+    filter_backends = (filters.GenericUserFilter, filters.GenericRoleFilter, DjangoFilterBackend)
     filter_class = filters.CustomerFilter
 
     def list(self, request, *args, **kwargs):
@@ -70,6 +66,8 @@ class CustomerViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
 
         - customers that the user owns
         - customers that have a project where user has a role
+
+        Staff also can filter customers by user UUID, for example /api/customers/?user_uuid=<UUID>
         """
         return super(CustomerViewSet, self).list(request, *args, **kwargs)
 
@@ -112,7 +110,7 @@ class CustomerViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         """
         Deletion of a customer is done through sending a **DELETE** request to the customer instance URI. Please note,
-        that if a customer has connected projects or project groups, deletion request will fail with 409 response code.
+        that if a customer has connected projects, deletion request will fail with 409 response code.
 
         Valid request example (token is user specific):
 
@@ -138,7 +136,7 @@ class CustomerViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         customer = serializer.save()
         if not self.request.user.is_staff:
-            customer.add_user(self.request.user, models.CustomerRole.OWNER)
+            customer.add_user(self.request.user, models.CustomerRole.OWNER, self.request.user)
 
     @detail_route()
     def balance_history(self, request, uuid=None):
@@ -157,11 +155,15 @@ class CustomerViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
         serializer = serializers.BalanceHistorySerializer(queryset, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @detail_route()
+    @detail_route(filter_backends=[filters.GenericRoleFilter])
     def users(self, request, uuid=None):
-        """ A list of users connected to the customer """
+        """ A list of users connected to the customer. """
         customer = self.get_object()
-        queryset = self.paginate_queryset(customer.get_users())
+        queryset = customer.get_users()
+        # we need to handle filtration manually because we want to filter only customer users, not customers.
+        filter_backend = filters.UserConcatenatedNameOrderingBackend()
+        queryset = filter_backend.filter_queryset(request, queryset, self)
+        queryset = self.paginate_queryset(queryset)
         serializer = self.get_serializer(queryset, many=True)
         return self.get_paginated_response(serializer.data)
 
@@ -190,14 +192,18 @@ class CustomerImageView(generics.RetrieveAPIView, generics.UpdateAPIView, generi
         raise PermissionDenied()
 
 
-class ProjectViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
+class ProjectViewSet(core_mixins.EagerLoadMixin, core_views.ActionsViewSet):
     queryset = models.Project.objects.all()
     serializer_class = serializers.ProjectSerializer
     lookup_field = 'uuid'
-    filter_backends = (filters.GenericRoleFilter, core_filters.DjangoMappingFilterBackend)
-    permission_classes = (rf_permissions.IsAuthenticated,
-                          rf_permissions.DjangoObjectPermissions)
+    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend)
     filter_class = filters.ProjectFilter
+
+    def get_serializer_context(self):
+        context = super(ProjectViewSet, self).get_serializer_context()
+        if self.action == 'users':
+            context['project'] = self.get_object()
+        return context
 
     def list(self, request, *args, **kwargs):
         """
@@ -211,7 +217,7 @@ class ProjectViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
 
         Supported logic filters:
 
-        - ?can_manage - return a list of projects where current user is manager, group manager or a customer owner;
+        - ?can_manage - return a list of projects where current user is manager or a customer owner;
         - ?can_admin - return a list of projects where current user is admin;
         """
         return super(ProjectViewSet, self).list(request, *args, **kwargs)
@@ -246,9 +252,6 @@ class ProjectViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
             {
                 "name": "Project A",
                 "customer": "http://example.com/api/customers/6c9b01c251c24174a6691a1f894fae31/",
-                "project_groups": [
-                    { "url": "http://localhost:8000/api/project-groups/b04f53e72e9b46949fa7c3a0ef52cd91/"}
-                ]
             }
         """
         return super(ProjectViewSet, self).create(request, *args, **kwargs)
@@ -268,19 +271,13 @@ class ProjectViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
         """
         return super(ProjectViewSet, self).destroy(request, *args, **kwargs)
 
-    def can_create_project_with(self, customer, project_groups):
+    def can_create_project_with(self, customer):
         user = self.request.user
 
         if user.is_staff:
             return True
 
         if customer.has_user(user, models.CustomerRole.OWNER):
-            return True
-
-        if project_groups and all(
-                project_group.has_user(user, models.ProjectGroupRole.MANAGER)
-                for project_group in project_groups
-        ):
             return True
 
         return False
@@ -292,146 +289,61 @@ class ProjectViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
         can_manage = self.request.query_params.get('can_manage', None)
         if can_manage is not None:
             queryset = queryset.filter(
-                Q(customer__roles__permission_group__user=user,
-                  customer__roles__role_type=models.CustomerRole.OWNER) |
-                Q(roles__permission_group__user=user,
-                  roles__role_type=models.ProjectRole.MANAGER)
+                Q(customer__permissions__user=user,
+                  customer__permissions__role=models.CustomerRole.OWNER,
+                  customer__permissions__is_active=True) |
+                Q(permissions__user=user,
+                  permissions__role=models.ProjectRole.MANAGER,
+                  permissions__is_active=True)
             ).distinct()
 
         can_admin = self.request.query_params.get('can_admin', None)
 
         if can_admin is not None:
             queryset = queryset.filter(
-                roles__permission_group__user=user,
-                roles__role_type=models.ProjectRole.ADMINISTRATOR,
+                permissions__user=user,
+                permissions__role=models.ProjectRole.ADMINISTRATOR,
+                permissions__is_active=True
             )
 
         return queryset
 
     def perform_create(self, serializer):
         customer = serializer.validated_data['customer']
-        project_groups = serializer.validated_data['project_groups']
 
-        if not self.can_create_project_with(customer, project_groups):
-            raise PermissionDenied('You do not have permission to perform this action.')
+        if not self.can_create_project_with(customer):
+            raise PermissionDenied()
 
         customer.validate_quota_change({'nc_project_count': 1}, raise_exception=True)
 
         super(ProjectViewSet, self).perform_create(serializer)
 
+    @detail_route(filter_backends=[filters.GenericRoleFilter])
+    def users(self, request, uuid=None):
+        """ A list of users connected to the project """
+        project = self.get_object()
+        queryset = project.get_users()
+        # we need to handle filtration manually because we want to filter only project users, not projects.
+        filter_backend = filters.UserConcatenatedNameOrderingBackend()
+        queryset = filter_backend.filter_queryset(request, queryset, self)
+        queryset = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(queryset, many=True)
+        return self.get_paginated_response(serializer.data)
 
-class ProjectGroupViewSet(viewsets.ModelViewSet):
-    queryset = models.ProjectGroup.objects.all()
-    serializer_class = serializers.ProjectGroupSerializer
-    lookup_field = 'uuid'
-    filter_backends = (filters.GenericRoleFilter, core_filters.DjangoMappingFilterBackend)
-    # permission_classes = (permissions.IsAuthenticated,)  # TODO: Add permissions for Create/Update
-    filter_class = filters.ProjectGroupFilter
+    users_serializer_class = serializers.ProjectUserSerializer
 
-    def list(self, request, *args, **kwargs):
-        """
-        To get a list of projects groups, run **GET** against */api/project-groups/* as authenticated user.
-        Note that a user can only see connected project groups:
+    @detail_route(methods=['post'])
+    def update_certifications(self, request, uuid=None):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        serialized_instance = serializers.ProjectSerializer(instance, context={'request': self.request})
 
-        - project groups that the user owns as a customer;
-        - project groups with projects where user has a role.
+        return Response(serialized_instance.data, status=status.HTTP_200_OK)
 
-        A new project group can be created by users with staff privilege (is_staff=True) or customer owners.
-        Project group resource quota is optional. Example of a valid request:
-
-        .. code-block:: http
-
-            POST /api/project-groups/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "name": "Project group A",
-                "customer": "http://example.com/api/customers/6c9b01c251c24174a6691a1f894fae31/",
-            }
-        """
-        return super(ProjectGroupViewSet, self).list(request, *args, **kwargs)
-
-    def retrieve(self, request, *args, **kwargs):
-        """
-        Deletion of a project group is done through sending a **DELETE** request to the project group instance URI.
-        Please note, that if a project group has connected projects, deletion request will fail with 409 response code.
-
-        Valid request example (token is user specific):
-
-        .. code-block:: http
-
-            DELETE /api/project-groups/6c9b01c251c24174a6691a1f894fae31/ HTTP/1.1
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-        """
-        return super(ProjectGroupViewSet, self).retrieve(request, *args, **kwargs)
-
-
-class ProjectGroupMembershipViewSet(mixins.CreateModelMixin,
-                                    mixins.RetrieveModelMixin,
-                                    mixins.DestroyModelMixin,
-                                    mixins.ListModelMixin,
-                                    viewsets.GenericViewSet):
-    queryset = models.ProjectGroup.projects.through.objects.all()
-    serializer_class = serializers.ProjectGroupMembershipSerializer
-    filter_backends = (filters.GenericRoleFilter, rf_filters.DjangoFilterBackend,)
-    filter_class = filters.ProjectGroupMembershipFilter
-
-    def perform_create(self, serializer):
-        super(ProjectGroupMembershipViewSet, self).perform_create(serializer)
-
-        project = serializer.validated_data['project']
-        project_group = serializer.validated_data['projectgroup']
-
-        event_logger.project_group_membership.info(
-            'Project {project_name} has been added to project group {project_group_name}.',
-            event_type='project_added_to_project_group',
-            event_context={
-                'project': project,
-                'project_group': project_group,
-            })
-
-    def perform_destroy(self, instance):
-        super(ProjectGroupMembershipViewSet, self).perform_destroy(instance)
-
-        project = instance.project
-        project_group = instance.projectgroup
-        event_logger.project_group_membership.info(
-            'Project {project_name} has been removed from project group {project_group_name}.',
-            event_type='project_removed_from_project_group',
-            event_context={
-                'project': project,
-                'project_group': project_group,
-            })
-
-    def list(self, request, *args, **kwargs):
-        """
-        To get a list of connections between project and a project group,
-        run **GET** against */api/project-group-memberships/* as authenticated user.
-        Note that a user can only see connections of a project or a project group where a user has a role.
-
-        In order to link project to a project group, **POST** a connection between them to
-        */api/project-group-memberships/*.
-        Note that project and a project group must be from the same customer.
-        For example,
-
-        .. code-block:: http
-
-            POST /api/project-group-memberships/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "project_group": "http://example.com/api/project-groups/736038dc5cac47309111916eb6fe802d/",
-                "project": "http://example.com/api/projects/661ee58978d9487c8ac26c56836585e0/",
-            }
-        """
-        return super(ProjectGroupMembershipViewSet, self).list(request, *args, **kwargs)
+    update_certifications_serializer_class = serializers.ServiceCertificationsUpdateSerializer
+    update_certifications_permissions = [permissions.is_owner]
 
 
 class UserViewSet(viewsets.ModelViewSet):
@@ -441,6 +353,11 @@ class UserViewSet(viewsets.ModelViewSet):
     permission_classes = (
         rf_permissions.IsAuthenticated,
         permissions.IsAdminOrOwnerOrOrganizationManager,
+    )
+    filter_backends = (
+        filters.CustomerUserFilter,
+        filters.ProjectUserFilter,
+        DjangoFilterBackend,
     )
     filter_class = filters.UserFilter
 
@@ -455,16 +372,15 @@ class UserViewSet(viewsets.ModelViewSet):
 
         # TODO: refactor to a separate endpoint or structure
         # a special query for all users with assigned privileges that the current user can remove privileges from
-        if (not django_settings.NODECONDUCTOR.get('SHOW_ALL_USERS', True) and not user.is_staff) or \
-                'potential' in self.request.query_params:
+        if (not django_settings.NODECONDUCTOR.get('SHOW_ALL_USERS', True) and
+                not (user.is_staff or user.is_support)) or 'potential' in self.request.query_params:
             connected_customers_query = models.Customer.objects.all()
             # is user is not staff, allow only connected customers
-            if not user.is_staff:
+            if not (user.is_staff or user.is_support):
                 # XXX: Let the DB cry...
                 connected_customers_query = connected_customers_query.filter(
-                    Q(roles__permission_group__user=user) |
-                    Q(projects__roles__permission_group__user=user) |
-                    Q(project_groups__roles__permission_group__user=user)
+                    Q(permissions__user=user, permissions__is_active=True) |
+                    Q(projects__permissions__user=user, projects__permissions__is_active=True)
                 ).distinct()
 
             # check if we need to filter potential users by a customer
@@ -482,14 +398,14 @@ class UserViewSet(viewsets.ModelViewSet):
 
             queryset = queryset.filter(is_staff=False).filter(
                 # customer users
-                Q(groups__customerrole__customer__in=connected_customers) |
-                Q(groups__projectrole__project__customer__in=connected_customers) |
-                Q(groups__projectgrouprole__project_group__customer__in=connected_customers) |
+                Q(customerpermission__customer__in=connected_customers,
+                  customerpermission__is_active=True) |
+                Q(projectpermission__project__customer__in=connected_customers,
+                  projectpermission__is_active=True) |
                 # users with no role
                 Q(
-                    groups__customerrole=None,
-                    groups__projectrole=None,
-                    groups__projectgrouprole=None,
+                    customerpermission=None,
+                    projectpermission=None,
                     organization_approved=True,
                     organization__in=potential_organizations,
                 )
@@ -499,7 +415,7 @@ class UserViewSet(viewsets.ModelViewSet):
         if organization_claimed is not None:
             queryset = queryset.exclude(organization__isnull=True).exclude(organization__exact='')
 
-        if not user.is_staff:
+        if not (user.is_staff or user.is_support):
             queryset = queryset.filter(is_active=True)
             # non-staff users cannot see staff through rest
             queryset = queryset.filter(is_staff=False)
@@ -621,7 +537,7 @@ class UserViewSet(viewsets.ModelViewSet):
         user.set_password(new_password)
         user.save()
 
-        return Response({'detail': "Password has been successfully updated"},
+        return Response({'detail': _('Password has been successfully updated.')},
                         status=status.HTTP_200_OK)
 
     @detail_route(methods=['post'])
@@ -637,7 +553,7 @@ class UserViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
 
         if instance.organization and instance.organization_approved:
-            return Response({'detail': "User has approved organization. Remove it before claiming a new one."},
+            return Response({'detail': _('User has approved organization. Remove it before claiming a new one.')},
                             status=status.HTTP_409_CONFLICT)
 
         organization = serializer.validated_data['organization']
@@ -654,7 +570,7 @@ class UserViewSet(viewsets.ModelViewSet):
                 'affected_organization': instance.organization,
             })
 
-        return Response({'detail': "User request for joining the organization has been successfully submitted."},
+        return Response({'detail': _('User request for joining the organization has been successfully submitted.')},
                         status=status.HTTP_200_OK)
 
     @detail_route(methods=['post'])
@@ -676,7 +592,7 @@ class UserViewSet(viewsets.ModelViewSet):
                 'affected_organization': instance.organization,
             })
 
-        return Response({'detail': "User request for joining the organization has been successfully approved"},
+        return Response({'detail': _('User request for joining the organization has been successfully approved.')},
                         status=status.HTTP_200_OK)
 
     @detail_route(methods=['post'])
@@ -699,7 +615,7 @@ class UserViewSet(viewsets.ModelViewSet):
                 'affected_organization': old_organization,
             })
 
-        return Response({'detail': "User has been successfully rejected from the organization"},
+        return Response({'detail': _('User has been successfully rejected from the organization.')},
                         status=status.HTTP_200_OK)
 
     @detail_route(methods=['post'])
@@ -722,21 +638,15 @@ class UserViewSet(viewsets.ModelViewSet):
                 'affected_organization': old_organization,
             })
 
-        return Response({'detail': "User has been successfully removed from the organization"},
+        return Response({'detail': _('User has been successfully removed from the organization.')},
                         status=status.HTTP_200_OK)
 
 
-class ProjectPermissionViewSet(mixins.CreateModelMixin,
-                               mixins.RetrieveModelMixin,
-                               mixins.ListModelMixin,
-                               mixins.DestroyModelMixin,
-                               viewsets.GenericViewSet):
+class ProjectPermissionViewSet(viewsets.ModelViewSet):
     """
     - Projects are connected to customers, whereas the project may belong to one customer only,
       and the customer may have
       multiple projects.
-    - Projects are connected to project groups, whereas the project may belong to multiple project groups,
-      and the project group may contain multiple projects.
     - Projects are connected to services, whereas the project may contain multiple services,
       and the service may belong to multiple projects.
     - Staff members can list all available projects of any customer and create new projects.
@@ -747,46 +657,21 @@ class ProjectPermissionViewSet(mixins.CreateModelMixin,
     """
     # See CustomerPermissionViewSet for implementation details.
 
-    queryset = User.groups.through.objects.exclude(group__projectrole=None)
+    queryset = models.ProjectPermission.objects.filter(is_active=True)
     serializer_class = serializers.ProjectPermissionSerializer
     permission_classes = (rf_permissions.IsAuthenticated,)
-    filter_backends = (filters.GenericRoleFilter, rf_filters.DjangoFilterBackend,)
+    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend,)
     filter_class = filters.ProjectPermissionFilter
-
-    def can_manage_roles_for(self, project):
-        user = self.request.user
-        if user.is_staff:
-            return True
-
-        if project.customer.has_user(user, models.CustomerRole.OWNER):
-            return True
-
-        for project_group in project.project_groups.iterator():
-            if project_group.has_user(user, models.ProjectGroupRole.MANAGER):
-                return True
-
-        return False
-
-    def get_queryset(self):
-        queryset = super(ProjectPermissionViewSet, self).get_queryset()
-
-        # TODO: refactor against django filtering
-        user_uuid = self.request.query_params.get('user', None)
-        if user_uuid is not None:
-            queryset = queryset.filter(user__uuid=user_uuid)
-
-        return queryset
 
     def list(self, request, *args, **kwargs):
         """
-        Project permissions expresses connection of users to a project. Each project has two associated user groups that
-        represent project managers and administrators. The link is maintained
-        through */api/project-permissions/* endpoint.
+        Project permissions expresses connection of user to a project.
+        User may have either project manager or system administrator permission in the project.
+        Use */api/project-permissions/* endpoint to maintain project permissions.
 
-        Note that project membership can be viewed and modified only by customer owners, corresponding project group
-        managers and staff users.
+        Note that project permissions can be viewed and modified only by customer owners and staff users.
 
-        To list all visible links, run a **GET** query against a list.
+        To list all visible permissions, run a **GET** query against a list.
         Response will contain a list of project users and their brief data.
 
         To add a new user to the project, **POST** a new relationship to */api/project-permissions/* endpoint specifying
@@ -807,9 +692,9 @@ class ProjectPermissionViewSet(mixins.CreateModelMixin,
         """
         return super(ProjectPermissionViewSet, self).list(request, *args, **kwargs)
 
-    def retrieve(self, request, *args, **kwargs):
+    def destroy(self, request, *args, **kwargs):
         """
-        To remove a user from a project group, delete corresponding connection (**url** field). Successful deletion
+        To remove a user from a project, delete corresponding connection (**url** field). Successful deletion
         will return status code 204.
 
         .. code-block:: http
@@ -818,181 +703,81 @@ class ProjectPermissionViewSet(mixins.CreateModelMixin,
             Authorization: Token 95a688962bf68678fd4c8cec4d138ddd9493c93b
             Host: example.com
         """
-        return super(ProjectPermissionViewSet, self).retrieve(request, *args, **kwargs)
+        return super(ProjectPermissionViewSet, self).destroy(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         affected_project = serializer.validated_data['project']
         affected_user = serializer.validated_data['user']
+        role = serializer.validated_data['role']
+        expiration_time = serializer.validated_data.get('expiration_time')
 
-        if not self.can_manage_roles_for(affected_project):
-            raise PermissionDenied('You do not have permission to perform this action.')
+        if not affected_project.can_manage_role(self.request.user, role, expiration_time):
+            raise PermissionDenied()
 
         if not affected_project.customer.get_users().filter(pk=affected_user.pk).exists():
             affected_project.customer.validate_quota_change({'nc_user_count': 1}, raise_exception=True)
 
         super(ProjectPermissionViewSet, self).perform_create(serializer)
 
+    def perform_update(self, serializer):
+        affected_project = serializer.instance.project
+        role = serializer.instance.role
+        expiration_time = serializer.validated_data.get('expiration_time', serializer.instance.expiration_time)
+
+        if not affected_project.can_manage_role(self.request.user, role, expiration_time)\
+                or serializer.instance.user == self.request.user:
+            raise PermissionDenied()
+
+        serializer.save()
+
     def perform_destroy(self, instance):
         affected_user = instance.user
-        affected_project = instance.group.projectrole.project
-        role = instance.group.projectrole.role_type
+        affected_project = instance.project
+        role = instance.role
+        expiration_time = instance.expiration_time
 
-        if not self.can_manage_roles_for(affected_project):
-            raise PermissionDenied('You do not have permission to perform this action.')
+        if not affected_project.can_manage_role(self.request.user, role, expiration_time):
+            raise PermissionDenied()
 
         affected_project.remove_user(affected_user, role)
 
 
-class ProjectGroupPermissionViewSet(mixins.CreateModelMixin,
-                                    mixins.RetrieveModelMixin,
-                                    mixins.ListModelMixin,
-                                    mixins.DestroyModelMixin,
-                                    viewsets.GenericViewSet):
-    """
-    Project group permissions expresses connection of users to project groups.
-    A single role is supported - Project Group manager.
-
-    Management is done through */api/project-group-permissions/* endpoint.
-    """
-    # See CustomerPermissionViewSet for implementation details.
-    queryset = User.groups.through.objects.exclude(group__projectgrouprole=None)
-    serializer_class = serializers.ProjectGroupPermissionSerializer
+class ProjectPermissionLogViewSet(mixins.RetrieveModelMixin,
+                                  mixins.ListModelMixin,
+                                  viewsets.GenericViewSet):
+    queryset = models.ProjectPermission.objects.filter(is_active=None)
+    serializer_class = serializers.ProjectPermissionLogSerializer
     permission_classes = (rf_permissions.IsAuthenticated,)
-    filter_backends = (rf_filters.DjangoFilterBackend,)
-    filter_class = filters.ProjectGroupPermissionFilter
-
-    def can_manage_roles_for(self, project_group):
-        user = self.request.user
-        if user.is_staff:
-            return True
-
-        if project_group.customer.has_user(user, models.CustomerRole.OWNER):
-            return True
-
-        return False
-
-    def get_queryset(self):
-        queryset = super(ProjectGroupPermissionViewSet, self).get_queryset()
-
-        # TODO: refactor against django filtering
-        user_uuid = self.request.query_params.get('user', None)
-        if user_uuid is not None:
-            queryset = queryset.filter(user__uuid=user_uuid)
-
-        # XXX: This should be removed after permissions refactoring
-        if not self.request.user.is_staff:
-            queryset = queryset.filter(
-                Q(group__projectgrouprole__project_group__customer__roles__permission_group__user=self.request.user,
-                  group__projectgrouprole__project_group__customer__roles__role_type=models.CustomerRole.OWNER) |
-                Q(group__projectgrouprole__project_group__projects__roles__permission_group__user=self.request.user) |
-                Q(group__projectgrouprole__project_group__roles__permission_group__user=self.request.user)
-            ).distinct()
-
-        return queryset
-
-    def list(self, request, *args, **kwargs):
-        """
-        To list all visible permissions, run a **GET** query against a list.
-        Response will contain a list of project groups' users and their brief data.
-
-        To add a new user to the project group, **POST** a new relationship
-        to **api/project-permissions** endpoint specifying project, user
-        and the role of the user (currently the only role is '1' - project group manager):
-
-        .. code-block:: http
-
-            POST /api/project-permissions/ HTTP/1.1
-            Accept: application/json
-            Authorization: Token 95a688962bf68678fd4c8cec4d138ddd9493c93b
-            Host: example.com
-
-            {
-                "project": "http://example.com/api/projects-groups/6c9b01c251c24174a6691a1f894fae31/",
-                "role": "manager",
-                "user": "http://example.com/api/users/82cec6c8e0484e0ab1429412fe4194b7/"
-            }
-        """
-        return super(ProjectGroupPermissionViewSet, self).list(request, *args, **kwargs)
-
-    def retrieve(self, request, *args, **kwargs):
-        """
-        To remove a user from a project group, delete corresponding connection (**url** field). Successful deletion
-        will return status code 204.
-
-        .. code-block:: http
-
-            DELETE /api/project-group-permissions/42/ HTTP/1.1
-            Authorization: Token 95a688962bf68678fd4c8cec4d138ddd9493c93b
-            Host: example.com
-        """
-
-        return super(ProjectGroupPermissionViewSet, self).retrieve(request, *args, **kwargs)
-
-    def perform_create(self, serializer):
-        affected_project_group = serializer.validated_data['project_group']
-        affected_user = serializer.validated_data['user']
-
-        if not self.can_manage_roles_for(affected_project_group):
-            raise PermissionDenied('You do not have permission to perform this action.')
-
-        if not affected_project_group.customer.get_users().filter(pk=affected_user.pk).exists():
-            affected_project_group.customer.validate_quota_change({'nc_user_count': 1}, raise_exception=True)
-
-        super(ProjectGroupPermissionViewSet, self).perform_create(serializer)
-
-    def perform_destroy(self, instance):
-        affected_user = instance.user
-        affected_project_group = instance.group.projectgrouprole.project_group
-        role = instance.group.projectgrouprole.role_type
-
-        if not self.can_manage_roles_for(affected_project_group):
-            raise PermissionDenied('You do not have permission to perform this action.')
-
-        affected_project_group.remove_user(affected_user, role)
+    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend,)
+    filter_class = filters.ProjectPermissionFilter
 
 
-class CustomerPermissionViewSet(mixins.CreateModelMixin,
-                                mixins.RetrieveModelMixin,
-                                mixins.ListModelMixin,
-                                mixins.DestroyModelMixin,
-                                viewsets.GenericViewSet):
+class CustomerPermissionViewSet(viewsets.ModelViewSet):
     """
     - Customers are connected to users through roles, whereas user may have role "customer owner".
     - Each customer may have multiple owners, and each user may own multiple customers.
     - Staff members can list all available customers and create new customers.
-      Customer owners can list all customers they own. Customer owners can also create new customers.
+    - Customer owners can list all customers they own. Customer owners can also create new customers.
     - Project administrators can list all the customers that own any of the projects they are administrators in.
     - Project managers can list all the customers that own any of the projects they are managers in.
     """
-    queryset = User.groups.through.objects.exclude(group__customerrole=None)
+    queryset = models.CustomerPermission.objects.filter(is_active=True)
     serializer_class = serializers.CustomerPermissionSerializer
     permission_classes = (
         rf_permissions.IsAuthenticated,
         # DjangoObjectPermissions not used on purpose, see below.
         # rf_permissions.DjangoObjectPermissions,
     )
-    filter_backends = (rf_filters.DjangoFilterBackend,)
     filter_class = filters.CustomerPermissionFilter
-
-    def can_manage_roles_for(self, customer):
-        user = self.request.user
-        if user.is_staff:
-            return True
-
-        if customer.has_user(user, models.CustomerRole.OWNER):
-            return True
-
-        return False
 
     def get_queryset(self):
         queryset = super(CustomerPermissionViewSet, self).get_queryset()
 
-        if not self.request.user.is_staff:
+        if not (self.request.user.is_staff or self.request.user.is_support):
             queryset = queryset.filter(
-                Q(group__customerrole__customer__roles__permission_group__user=self.request.user,
-                  group__customerrole__customer__roles__role_type=models.CustomerRole.OWNER) |
-                Q(group__customerrole__customer__projects__roles__permission_group__user=self.request.user) |
-                Q(group__customerrole__customer__project_groups__roles__permission_group__user=self.request.user)
+                Q(user=self.request.user, is_active=True) |
+                Q(customer__projects__permissions__user=self.request.user, is_active=True) |
+                Q(customer__permissions__user=self.request.user, is_active=True)
             ).distinct()
 
         return queryset
@@ -1042,9 +827,10 @@ class CustomerPermissionViewSet(mixins.CreateModelMixin,
     def perform_create(self, serializer):
         affected_customer = serializer.validated_data['customer']
         affected_user = serializer.validated_data['user']
+        expiration_time = serializer.validated_data.get('expiration_time')
 
-        if not self.can_manage_roles_for(affected_customer):
-            raise PermissionDenied('You do not have permission to perform this action.')
+        if not affected_customer.can_manage_role(self.request.user, expiration_time):
+            raise PermissionDenied()
 
         if not affected_customer.get_users().filter(pk=affected_user.pk).exists():
             affected_customer.validate_quota_change({'nc_user_count': 1}, raise_exception=True)
@@ -1054,20 +840,41 @@ class CustomerPermissionViewSet(mixins.CreateModelMixin,
         # no url will be rendered in response.
         super(CustomerPermissionViewSet, self).perform_create(serializer)
 
+    def perform_update(self, serializer):
+        affected_customer = serializer.instance.customer
+        expiration_time = serializer.validated_data.get('expiration_time', serializer.instance.expiration_time)
+
+        if not affected_customer.can_manage_role(self.request.user, expiration_time) \
+                or serializer.instance.user == self.request.user:
+            raise PermissionDenied()
+
+        serializer.save()
+
     def perform_destroy(self, instance):
         affected_user = instance.user
-        affected_customer = instance.group.customerrole.customer
-        role = instance.group.customerrole.role_type
+        affected_customer = instance.customer
+        role = instance.role
+        expiration_time = instance.expiration_time
 
-        if not self.can_manage_roles_for(affected_customer):
-            raise PermissionDenied('You do not have permission to perform this action.')
+        if not affected_customer.can_manage_role(self.request.user, expiration_time):
+            raise PermissionDenied()
 
         affected_customer.remove_user(affected_user, role)
 
 
+class CustomerPermissionLogViewSet(mixins.RetrieveModelMixin,
+                                   mixins.ListModelMixin,
+                                   viewsets.GenericViewSet):
+    queryset = models.CustomerPermission.objects.filter(is_active=None)
+    serializer_class = serializers.CustomerPermissionLogSerializer
+    permission_classes = (rf_permissions.IsAuthenticated,)
+    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend,)
+    filter_class = filters.CustomerPermissionFilter
+
+
 class CreationTimeStatsView(views.APIView):
     """
-    Historical information about creation time of projects, project groups and customers.
+    Historical information about creation time of projects and customers.
     """
     def get(self, request, format=None):
         month = 60 * 60 * 24 * 30
@@ -1088,7 +895,7 @@ class CreationTimeStatsView(views.APIView):
         """
         Available request parameters:
 
-        - ?type=type_of_statistics_objects (required. Have to be from the list: 'customer', 'project', 'project_group')
+        - ?type=type_of_statistics_objects (required. Have to be from the list: 'customer', 'project')
         - ?from=timestamp (default: now - 30 days, for example: 1415910025)
         - ?to=timestamp (default: now, for example: 1415912625)
         - ?datapoints=how many data points have to be in answer (default: 6)
@@ -1127,7 +934,7 @@ class SshKeyViewSet(mixins.CreateModelMixin,
     queryset = core_models.SshPublicKey.objects.all()
     serializer_class = serializers.SshKeySerializer
     lookup_field = 'uuid'
-    filter_backends = (rf_filters.DjangoFilterBackend, core_filters.StaffOrUserFilter)
+    filter_backends = (DjangoFilterBackend, core_filters.StaffOrUserFilter)
     filter_class = filters.SshKeyFilter
 
     def list(self, request, *args, **kwargs):
@@ -1160,7 +967,7 @@ class SshKeyViewSet(mixins.CreateModelMixin,
         name = serializer.validated_data['name']
 
         if core_models.SshPublicKey.objects.filter(user=user, name=name).exists():
-            raise rf_serializers.ValidationError({'name': ['This field must be unique.']})
+            raise rf_serializers.ValidationError({'name': [_('This field must be unique.')]})
 
         serializer.save(user=user)
 
@@ -1168,20 +975,19 @@ class SshKeyViewSet(mixins.CreateModelMixin,
         try:
             instance.delete()
         except Exception as e:
-            logger.exception("Can't remove SSH public key from backend")
+            logger.exception(_("Can't remove SSH public key from backend."))
             raise APIException(e)
 
 
-class ServiceSettingsViewSet(mixins.RetrieveModelMixin,
-                             mixins.UpdateModelMixin,
-                             mixins.ListModelMixin,
-                             viewsets.GenericViewSet):
+class ServiceSettingsViewSet(core_mixins.EagerLoadMixin,
+                             core_views.ActionsViewSet):
     queryset = models.ServiceSettings.objects.filter()
     serializer_class = serializers.ServiceSettingsSerializer
-    permission_classes = (rf_permissions.IsAuthenticated, rf_permissions.DjangoObjectPermissions)
-    filter_backends = (filters.GenericRoleFilter, rf_filters.DjangoFilterBackend)
+    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend,
+                       filters.ServiceSettingsScopeFilterBackend)
     filter_class = filters.ServiceSettingsFilter
     lookup_field = 'uuid'
+    disabled_actions = ['create', 'destroy']
 
     def list(self, request, *args, **kwargs):
         """
@@ -1196,6 +1002,17 @@ class ServiceSettingsViewSet(mixins.RetrieveModelMixin,
         - ?shared=<bool> - allows to filter shared service settings
         """
         return super(ServiceSettingsViewSet, self).list(request, *args, **kwargs)
+
+    def can_user_update_settings(request, view, obj=None):
+        """ Only staff can update shared settings, otherwise user has to be an owner of the settings."""
+        if obj is None:
+            return
+
+        # TODO [TM:3/21/17] clean it up after WAL-634. Clean up service settings update tests as well.
+        if obj.customer and not obj.shared:
+            return permissions.is_owner(request, view, obj)
+        else:
+            return permissions.is_staff(request, view, obj)
 
     def update(self, request, *args, **kwargs):
         """
@@ -1218,6 +1035,8 @@ class ServiceSettingsViewSet(mixins.RetrieveModelMixin,
             }
         """
         return super(ServiceSettingsViewSet, self).update(request, *args, **kwargs)
+
+    update_permissions = partial_update_permissions = [can_user_update_settings]
 
     @detail_route()
     def stats(self, request, uuid=None):
@@ -1260,8 +1079,24 @@ class ServiceSettingsViewSet(mixins.RetrieveModelMixin,
 
         return Response(stats, status=status.HTTP_200_OK)
 
+    @detail_route(methods=['post'])
+    def update_certifications(self, request, uuid=None):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        serialized_instance = serializers.ServiceSettingsSerializer(instance, context={'request': self.request})
+
+        return Response(serialized_instance.data, status=status.HTTP_200_OK)
+
+    update_certifications_serializer_class = serializers.ServiceCertificationsUpdateSerializer
+    update_certifications_permissions = [can_user_update_settings]
+
 
 class ServiceMetadataViewSet(viewsets.GenericViewSet):
+    # Fix for schema generation
+    queryset = []
+
     def list(self, request):
         """
         To get a list of supported service types, run **GET** against */api/service-metadata/* as an authenticated user.
@@ -1270,12 +1105,11 @@ class ServiceMetadataViewSet(viewsets.GenericViewSet):
         return Response(SupportedServices.get_services_with_resources(request))
 
 
-class ResourceViewSet(mixins.ListModelMixin,
-                      viewsets.GenericViewSet):
+class ResourceSummaryViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
     """
     Use */api/resources/* to get a list of all the resources of any type that a user can see.
     """
-    model = models.Resource  # for permissions definition.
+    model = models.NewResource  # for permissions definition.
     serializer_class = serializers.SummaryResourceSerializer
     permission_classes = (rf_permissions.IsAuthenticated, rf_permissions.DjangoObjectPermissions)
     filter_backends = (filters.GenericRoleFilter, filters.ResourceSummaryFilterBackend, filters.TagsFilter)
@@ -1296,15 +1130,19 @@ class ResourceViewSet(mixins.ListModelMixin,
 
     def _filter_by_category(self, resource_models):
         choices = {
-            'apps': models.ResourceMixin.get_app_models(),
-            'vms': models.ResourceMixin.get_vm_models(),
-            'private_clouds': models.ResourceMixin.get_private_cloud_models()
+            'apps': models.ApplicationMixin.get_all_models(),
+            'vms': models.VirtualMachineMixin.get_all_models(),
+            'private_clouds': models.PrivateCloud.get_all_models(),
+            'storages': models.Storage.get_all_models(),
         }
         category = self.request.query_params.get('resource_category')
+        if not category:
+            return resource_models
+
         category_models = choices.get(category)
         if category_models:
-            resource_models = {k: v for k, v in resource_models.items() if v in category_models}
-        return resource_models
+            return {k: v for k, v in resource_models.items() if v in category_models}
+        return {}
 
     def list(self, request, *args, **kwargs):
         """
@@ -1324,7 +1162,7 @@ class ResourceViewSet(mixins.ListModelMixin,
 
           /api/<resource_endpoint>/?resource_type=DigitalOcean.Droplet&resource_type=OpenStack.Instance
 
-        - Specify category, one of vms, apps or private_clouds, for example:
+        - Specify category, one of vms, apps, private_clouds or storages for example:
 
           /api/<resource_endpoint>/?category=vms
 
@@ -1405,7 +1243,7 @@ class ResourceViewSet(mixins.ListModelMixin,
          - ?o=tag__license-os - order by tag with particular prefix. Instances without given tag will not be returned.
         """
 
-        return super(ResourceViewSet, self).list(request, *args, **kwargs)
+        return super(ResourceSummaryViewSet, self).list(request, *args, **kwargs)
 
     @list_route()
     def count(self, request):
@@ -1441,7 +1279,8 @@ class ServicesViewSet(mixins.ListModelMixin,
         service_models = {k: v['service'] for k, v in SupportedServices.get_service_models().items()}
         service_models = self._filter_by_types(service_models)
         # TODO: filter models by service type.
-        return managers.ServiceSummaryQuerySet(service_models.values())
+        queryset = managers.ServiceSummaryQuerySet(service_models.values())
+        return serializers.SummaryServiceSerializer.eager_load(queryset)
 
     def _filter_by_types(self, service_models):
         types = self.request.query_params.getlist('service_type', None)
@@ -1461,17 +1300,36 @@ class ServicesViewSet(mixins.ListModelMixin,
         return super(ServicesViewSet, self).list(request, *args, **kwargs)
 
 
-class CounterMixin(object):
-    def get_count(self, url, params):
+class BaseCounterView(viewsets.GenericViewSet):
+    # Fix for schema generation
+    queryset = []
+
+    def list(self, request, uuid=None):
+        result = {}
+        fields = request.query_params.getlist('fields') or self.get_fields().keys()
+        for field, func in self.get_fields().items():
+            if field in fields:
+                result[field] = func()
+
+        return Response(result)
+
+    def get_fields(self):
+        raise NotImplementedError()
+
+    @cached_property
+    def object(self):
+        return self.get_object()
+
+    def get_count(self, url, params=None):
         response = request_api(self.request, url, method='HEAD', params=params)
         if response.ok:
             return response.total
         else:
-            logger.warning('Unable to execute API request with URL %s and error %s', url, response.data)
+            logger.warning('Unable to execute API request with URL %s and error %s', url, response.reason)
         return 0
 
 
-class CustomerCountersView(CounterMixin, viewsets.GenericViewSet):
+class CustomerCountersView(BaseCounterView):
     """
     Count number of entities related to customer
 
@@ -1479,9 +1337,6 @@ class CustomerCountersView(CounterMixin, viewsets.GenericViewSet):
 
         {
             "alerts": 12,
-            "vms": 1,
-            "apps": 0,
-            "private_clouds": 1,
             "services": 1,
             "projects": 1,
             "users": 3
@@ -1492,35 +1347,24 @@ class CustomerCountersView(CounterMixin, viewsets.GenericViewSet):
     def get_queryset(self):
         return filter_queryset_for_user(models.Customer.objects.all().only('pk', 'uuid'), self.request.user)
 
-    def list(self, request, uuid):
-        self.customer = self.get_object()
+    def get_fields(self):
+        return {
+            'alerts': self.get_alerts,
+            'projects': self.get_projects,
+            'services': self.get_services,
+            'users': self.get_users
+        }
 
-        return Response({
-            'alerts': self.get_alerts(),
-            'vms': self.get_vms(),
-            'apps': self.get_apps(),
-            'private_clouds': self.get_private_clouds(),
-            'projects': self.get_projects(),
-            'services': self.get_services(),
-            'users': self.customer.get_users().count()
-        })
+    def get_users(self):
+        return self.object.get_users().count()
 
     def get_alerts(self):
         return self.get_count('alert-list', {
             'aggregate': 'customer',
-            'uuid': self.customer.uuid.hex,
+            'uuid': self.object.uuid.hex,
             'exclude_features': self.request.query_params.getlist('exclude_features'),
             'opened': True
         })
-
-    def get_vms(self):
-        return self._total_count(models.ResourceMixin.get_vm_models())
-
-    def get_apps(self):
-        return self._total_count(models.ResourceMixin.get_app_models())
-
-    def get_private_clouds(self):
-        return self._total_count(models.ResourceMixin.get_private_cloud_models())
 
     def get_projects(self):
         return self._count_model(models.Project)
@@ -1533,12 +1377,12 @@ class CustomerCountersView(CounterMixin, viewsets.GenericViewSet):
         return sum(self._count_model(model) for model in models)
 
     def _count_model(self, model):
-        qs = model.objects.filter(customer=self.customer).only('pk')
+        qs = model.objects.filter(customer=self.object).only('pk')
         qs = filter_queryset_for_user(qs, self.request.user)
         return qs.count()
 
 
-class ProjectCountersView(CounterMixin, viewsets.GenericViewSet):
+class ProjectCountersView(BaseCounterView):
     """
     Count number of entities related to project
 
@@ -1550,6 +1394,7 @@ class ProjectCountersView(CounterMixin, viewsets.GenericViewSet):
             "apps": 0,
             "vms": 1,
             "private_clouds": 1,
+            "storages": 2,
             "premium_support_contracts": 0,
         }
     """
@@ -1558,57 +1403,57 @@ class ProjectCountersView(CounterMixin, viewsets.GenericViewSet):
     def get_queryset(self):
         return filter_queryset_for_user(models.Project.objects.all().only('pk', 'uuid'), self.request.user)
 
-    def list(self, request, uuid):
-        self.project = self.get_object()
-        self.project_uuid = self.project.uuid.hex
-        self.exclude_features = request.query_params.getlist('exclude_features')
-
-        return Response({
-            'alerts': self.get_alerts(),
-            'vms': self.get_vms(),
-            'apps': self.get_apps(),
-            'private_clouds': self.get_private_clouds(),
-            'users': self.get_users(),
-            'premium_support_contracts': self.get_premium_support_contracts()
-        })
+    def get_fields(self):
+        fields = {
+            'alerts': self.get_alerts,
+            'vms': self.get_vms,
+            'apps': self.get_apps,
+            'private_clouds': self.get_private_clouds,
+            'storages': self.get_storages,
+            'users': self.get_users
+        }
+        if 'nodeconductor_plus.premium_support' in django_settings.INSTALLED_APPS:
+            fields['premium_support_contracts'] = self.get_premium_support_contracts
+        return fields
 
     def get_alerts(self):
         return self.get_count('alert-list', {
             'aggregate': 'project',
-            'uuid': self.project_uuid,
-            'exclude_features': self.exclude_features,
+            'uuid': self.object.uuid.hex,
+            'exclude_features': self.request.query_params.getlist('exclude_features'),
             'opened': True
         })
 
     def get_vms(self):
-        return self._total_count(models.ResourceMixin.get_vm_models())
+        return self._total_count(models.VirtualMachineMixin.get_all_models())
 
     def get_apps(self):
-        return self._total_count(models.ResourceMixin.get_app_models())
+        return self._total_count(models.ApplicationMixin.get_all_models())
 
     def get_private_clouds(self):
-        return self._total_count(models.ResourceMixin.get_private_cloud_models())
+        return self._total_count(models.PrivateCloud.get_all_models())
+
+    def get_storages(self):
+        return self._total_count(models.Storage.get_all_models())
 
     def get_users(self):
-        return self.get_count('user-list', {
-            'project': self.project_uuid
-        })
+        return self.object.get_users().count()
 
     def get_premium_support_contracts(self):
         return self.get_count('premium-support-contract-list', {
-            'project_uuid': self.project_uuid
+            'project_uuid': self.object.uuid.hex
         })
 
     def _total_count(self, models):
         return sum(self._count_model(model) for model in models)
 
     def _count_model(self, model):
-        qs = model.objects.filter(project=self.project).only('pk')
+        qs = model.objects.filter(project=self.object).only('pk')
         qs = filter_queryset_for_user(qs, self.request.user)
         return qs.count()
 
 
-class UserCountersView(CounterMixin, viewsets.GenericViewSet):
+class UserCountersView(BaseCounterView):
     """
     Count number of entities related to current user
 
@@ -1619,21 +1464,20 @@ class UserCountersView(CounterMixin, viewsets.GenericViewSet):
             "hooks": 1
         }
     """
-    def list(self, request):
-        self.user_uuid = request.user.uuid.hex
 
-        return Response({
-            'keys': self.get_keys(),
-            'hooks': self.get_hooks()
-        })
+    def get_fields(self):
+        return {
+            'keys': self.get_keys,
+            'hooks': self.get_hooks
+        }
 
     def get_keys(self):
         return self.get_count('sshpublickey-list', {
-            'user_uuid': self.user_uuid
+            'user_uuid': self.request.user.uuid.hex
         })
 
     def get_hooks(self):
-        return self.get_count('hooks-list', {})
+        return self.get_count('hooks-list')
 
 
 class UpdateOnlyByPaidCustomerMixin(object):
@@ -1645,7 +1489,7 @@ class UpdateOnlyByPaidCustomerMixin(object):
         if settings.shared:
             if customer and customer.balance is not None and customer.balance <= 0:
                 raise PermissionDenied(
-                    "Your balance is %s. Action disabled." % customer.balance)
+                    _('Your balance is %s. Action disabled.') % customer.balance)
 
     def initial(self, request, *args, **kwargs):
         if hasattr(self, 'PaidControl') and self.action and self.action not in ('list', 'retrieve', 'create'):
@@ -1685,8 +1529,7 @@ class UpdateOnlyByPaidCustomerMixin(object):
 
 class BaseServiceViewSet(UpdateOnlyByPaidCustomerMixin,
                          core_mixins.EagerLoadMixin,
-                         core_mixins.UserContextMixin,
-                         viewsets.ModelViewSet):
+                         core_views.ActionsViewSet):
     class PaidControl:
         customer_path = 'customer'
         settings_path = 'settings'
@@ -1694,10 +1537,11 @@ class BaseServiceViewSet(UpdateOnlyByPaidCustomerMixin,
     queryset = NotImplemented
     serializer_class = NotImplemented
     import_serializer_class = NotImplemented
-    permission_classes = (rf_permissions.IsAuthenticated, rf_permissions.DjangoObjectPermissions)
-    filter_backends = (filters.GenericRoleFilter, rf_filters.DjangoFilterBackend)
+    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend)
     filter_class = filters.BaseServiceFilter
     lookup_field = 'uuid'
+    metadata_class = ActionsMetadata
+    unsafe_methods_permissions = [permissions.is_owner]
 
     def list(self, request, *args, **kwargs):
         """
@@ -1757,7 +1601,8 @@ class BaseServiceViewSet(UpdateOnlyByPaidCustomerMixin,
 
     def get_serializer_context(self):
         context = super(BaseServiceViewSet, self).get_serializer_context()
-        if self.action == 'link':
+        # Viewset doesn't have object during schema generation
+        if self.action == 'link' and self.lookup_field in self.kwargs:
             context['service'] = self.get_object()
         return context
 
@@ -1776,6 +1621,18 @@ class BaseServiceViewSet(UpdateOnlyByPaidCustomerMixin,
 
         serializer = serializers.ManagedResourceSerializer(resources, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def _has_import_serializer_permission(request, view, obj=None):
+        if not view._can_import():
+            raise MethodNotAllowed(view.action)
+
+    def _require_staff_for_shared_settings(request, view, obj=None):
+        """ Allow to execute action only if service settings are not shared or user is staff """
+        if obj is None:
+            return
+
+        if obj.settings.shared and not request.user.is_staff:
+            raise PermissionDenied(_('Only staff users are allowed to import resources from shared services.'))
 
     @detail_route(methods=['get', 'post'])
     def link(self, request, uuid=None):
@@ -1799,12 +1656,8 @@ class BaseServiceViewSet(UpdateOnlyByPaidCustomerMixin,
                 "project": "http://example.com/api/projects/e5f973af2eb14d2d8c38d62bcbaccb33/"
             }
         """
-        if not self._can_import():
-            raise MethodNotAllowed('link')
 
         service = self.get_object()
-        if service.settings.shared and not request.user.is_staff:
-            raise PermissionDenied("Only staff users are allowed to import resources from shared services.")
 
         if self.request.method == 'GET':
             try:
@@ -1822,19 +1675,19 @@ class BaseServiceViewSet(UpdateOnlyByPaidCustomerMixin,
             serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
 
-            customer = serializer.validated_data['project'].customer
-            if not request.user.is_staff and not customer.has_user(request.user):
-                raise PermissionDenied(
-                    "Only customer owner or staff are allowed to perform this action.")
-
             try:
                 resource = serializer.save()
             except ServiceBackendError as e:
                 raise APIException(e)
 
-            resource_imported.send(sender=resource.__class__, instance=resource)
+            resource_imported.send(
+                sender=resource.__class__,
+                instance=resource,
+            )
 
             return Response(serializer.data, status=status.HTTP_200_OK)
+
+    link_permissions = [_has_import_serializer_permission, _require_staff_for_shared_settings]
 
     def get_backend(self, service):
         # project_uuid can be supplied in order to get a list of resources
@@ -1845,29 +1698,39 @@ class BaseServiceViewSet(UpdateOnlyByPaidCustomerMixin,
             try:
                 spl = spl_class.objects.get(project__uuid=project_uuid, service=service)
             except:
-                raise NotFound("Can't find project %s" % project_uuid)
+                raise NotFound(_("Can't find project %s.") % project_uuid)
             else:
                 return spl.get_backend()
         else:
             return service.get_backend()
 
+    @detail_route(methods=['post'])
+    def unlink(self, request, uuid=None):
+        """
+        Unlink all related resources, service project link and service itself.
+        """
+        service = self.get_object()
+        service.unlink_descendants()
+        self.perform_destroy(service)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    unlink_permissions = [_require_staff_for_shared_settings]
+    unlink.destructive = True
+
 
 class BaseServiceProjectLinkViewSet(UpdateOnlyByPaidCustomerMixin,
-                                    core_mixins.UpdateOnlyStableMixin,
-                                    mixins.CreateModelMixin,
-                                    mixins.RetrieveModelMixin,
-                                    mixins.DestroyModelMixin,
-                                    mixins.ListModelMixin,
-                                    viewsets.GenericViewSet):
+                                    core_views.ActionsViewSet):
     class PaidControl:
         customer_path = 'service__customer'
         settings_path = 'service__settings'
 
     queryset = NotImplemented
     serializer_class = NotImplemented
-    permission_classes = (rf_permissions.IsAuthenticated, rf_permissions.DjangoObjectPermissions)
-    filter_backends = (filters.GenericRoleFilter, rf_filters.DjangoFilterBackend)
+    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend)
     filter_class = filters.BaseServiceProjectLinkFilter
+    unsafe_methods_permissions = [permissions.is_owner]
+    disabled_actions = ['update', 'partial_update']
 
     def list(self, request, *args, **kwargs):
         """
@@ -1894,7 +1757,7 @@ def safe_operation(valid_state=None):
 
         @functools.wraps(view_fn)
         def wrapped(self, request, *args, **kwargs):
-            message = "Performing %s operation is not allowed for resource in its current state"
+            message = _('Performing %s operation is not allowed for resource in its current state.')
             operation_name = view_fn.__name__
 
             try:
@@ -1904,7 +1767,7 @@ def safe_operation(valid_state=None):
 
                     # Important! We are passing back the instance from current transaction to a view
                     try:
-                        view_fn(self, request, resource, *args, **kwargs)
+                        response = view_fn(self, request, resource, *args, **kwargs)
                     except ServiceBackendNotImplemented:
                         raise MethodNotAllowed(operation_name)
 
@@ -1912,13 +1775,16 @@ def safe_operation(valid_state=None):
                 raise core_exceptions.IncorrectStateException(message % operation_name)
 
             except IntegrityError:
-                return Response({'status': '%s was not scheduled' % operation_name},
+                return Response({'status': _('%s was not scheduled.') % operation_name},
                                 status=status.HTTP_400_BAD_REQUEST)
+
+            if response is not None:
+                return response
 
             if resource.pk is None:
                 return Response(status=status.HTTP_204_NO_CONTENT)
 
-            return Response({'status': '%s was scheduled' % operation_name},
+            return Response({'status': _('%s was scheduled.') % operation_name},
                             status=status.HTTP_202_ACCEPTED)
 
         return wrapped
@@ -1930,7 +1796,7 @@ class ResourceViewMetaclass(type):
     def __new__(cls, name, bases, args):
         resource_view = super(ResourceViewMetaclass, cls).__new__(cls, name, bases, args)
         queryset = args.get('queryset')
-        if hasattr(queryset, 'model'):
+        if hasattr(queryset, 'model') and not issubclass(queryset.model, models.SubResource):
             SupportedServices.register_resource_view(queryset.model, resource_view)
         return resource_view
 
@@ -1943,188 +1809,43 @@ class ResourceViewMixin(core_mixins.EagerLoadMixin, UpdateOnlyByPaidCustomerMixi
     queryset = NotImplemented
     serializer_class = NotImplemented
     lookup_field = 'uuid'
-    permission_classes = (rf_permissions.IsAuthenticated, rf_permissions.DjangoObjectPermissions)
+    permission_classes = (
+        rf_permissions.IsAuthenticated,
+        rf_permissions.DjangoObjectPermissions
+    )
     filter_backends = (
         filters.GenericRoleFilter,
-        core_filters.DjangoMappingFilterBackend,
+        DjangoFilterBackend,
         SlaFilter,
         MonitoringItemFilter,
         filters.TagsFilter,
         filters.StartTimeFilter
     )
-    metadata_class = ResourceActionsMetadata
-
-
-class _BaseResourceViewSet(six.with_metaclass(ResourceViewMetaclass,
-                                              ResourceViewMixin,
-                                              core_mixins.UserContextMixin,
-                                              viewsets.ModelViewSet)):
-    filter_class = filters.BaseResourceFilter
-
-    def retrieve(self, request, *args, **kwargs):
-        """
-        Optional `field` query parameter (can be list) allows to limit what fields are returned.
-        For example, given request /api/openstack-instances/<uuid>/?field=uuid&field=name you get response like this:
-
-        .. code-block:: javascript
-
-            {
-                "uuid": "90bcfe38b0124c9bbdadd617b5d739f5",
-                "name": "Azure Virtual Machine"
-            }
-        """
-        return super(_BaseResourceViewSet, self).retrieve(request, *args, **kwargs)
+    metadata_class = ActionsMetadata
 
     def initial(self, request, *args, **kwargs):
-        if self.action in ('update', 'partial_update'):
-            resource = self.get_object()
-            if resource.state not in resource.States.STABLE_STATES:
-                raise core_exceptions.IncorrectStateException(
-                    'Modification allowed in stable states only')
+        super(ResourceViewMixin, self).initial(request, *args, **kwargs)
+        if 'uuid' in kwargs and self.action != 'metadata':
+            self.check_operation(request, self.get_object(), self.action)
 
-        elif self.action in ('stop', 'start', 'resize'):
-            resource = self.get_object()
-            if resource.state == resource.States.PROVISIONING_SCHEDULED:
-                raise core_exceptions.IncorrectStateException(
-                    'Provisioning scheduled. Disabled modifications.')
+    def check_operation(self, request, resource, action):
+        if action:
+            func = getattr(self, action)
+            valid_state = getattr(func, 'valid_state', None)
+            return check_operation(request.user, resource, action, valid_state)
 
-        super(_BaseResourceViewSet, self).initial(request, *args, **kwargs)
-
-    def perform_create(self, serializer):
-        service_project_link = serializer.validated_data['service_project_link']
-
-        if service_project_link.service.settings.state == core_models.SynchronizationStates.ERRED:
-            raise core_exceptions.IncorrectStateException(
-                detail='Cannot create resource if its service is in erred state.')
-
-        try:
-            self.perform_provision(serializer)
-        except ServiceBackendError as e:
-            raise APIException(e)
-
+    def log_resource_creation_scheduled(self, resource):
         event_logger.resource.info(
             '{resource_full_name} creation has been scheduled.',
             event_type='resource_creation_scheduled',
-            event_context={'resource': serializer.instance})
-
-    def perform_update(self, serializer):
-        old_name = serializer.instance.name
-        resource = serializer.save()
-
-        message = '{resource_full_name} has been updated.'
-        if old_name != resource.name:
-            message += ' Name was changed from %s to %s.' % (old_name, resource.name)
-
-        event_logger.resource.info(
-            message,
-            event_type='resource_update_succeeded',
             event_context={'resource': resource})
-
-    def perform_provision(self, serializer):
-        raise NotImplementedError
-
-    def perform_managed_resource_destroy(self, resource, force=False):
-        if resource.backend_id:
-            backend = resource.get_backend()
-            backend.destroy(resource, force=force)
-            event_logger.resource.info(
-                '{resource_full_name} has been scheduled for deletion.',
-                event_type='resource_deletion_scheduled',
-                event_context={'resource': resource})
-        else:
-            self.perform_destroy(resource)
-
-    @detail_route(methods=['post'])
-    @safe_operation()
-    def unlink(self, request, resource, uuid=None):
-        # XXX: add special attribute to an instance in order to be tracked by signal handler
-        setattr(resource, 'PERFORM_UNLINK', True)
-        self.perform_destroy(resource)
-    unlink.destructive = True
-
-
-# TODO: Consider renaming to BaseVirtualMachineViewSet
-class BaseResourceViewSet(_BaseResourceViewSet):
-    @safe_operation(valid_state=(models.Resource.States.OFFLINE, models.Resource.States.ERRED))
-    def destroy(self, request, resource, uuid=None):
-        self.perform_managed_resource_destroy(
-            resource, force=resource.state == models.Resource.States.ERRED)
-
-    @detail_route(methods=['post'])
-    @safe_operation(valid_state=models.Resource.States.OFFLINE)
-    def start(self, request, resource, uuid=None):
-        """
-        Schedule resource start. Resource must be in OFFLINE state.
-        """
-        backend = resource.get_backend()
-        backend.start(resource)
-        event_logger.resource.info(
-            'Resource {resource_name} has been scheduled to start.',
-            event_type='resource_start_scheduled',
-            event_context={'resource': resource})
-
-    @detail_route(methods=['post'])
-    @safe_operation(valid_state=models.Resource.States.ONLINE)
-    def stop(self, request, resource, uuid=None):
-        """
-        Schedule resource stop. Resource must be in ONLINE state.
-        """
-        backend = resource.get_backend()
-        backend.stop(resource)
-        event_logger.resource.info(
-            'Resource {resource_name} has been scheduled to stop.',
-            event_type='resource_stop_scheduled',
-            event_context={'resource': resource})
-
-    @detail_route(methods=['post'])
-    @safe_operation(valid_state=models.Resource.States.ONLINE)
-    def restart(self, request, resource, uuid=None):
-        """
-        Schedule resource restart. Resource must be in ONLINE state.
-        """
-        backend = resource.get_backend()
-        backend.restart(resource)
-        event_logger.resource.info(
-            'Resource {resource_name} has been scheduled to restart.',
-            event_type='resource_restart_scheduled',
-            event_context={'resource': resource})
-
-
-class BaseOnlineResourceViewSet(_BaseResourceViewSet):
-
-    # User can only create and delete this resource. He cannot stop them.
-    @safe_operation(valid_state=[models.Resource.States.ONLINE, models.Resource.States.ERRED])
-    def destroy(self, request, resource, uuid=None):
-        if resource.state == models.Resource.States.ONLINE:
-            resource.state = resource.States.OFFLINE
-            resource.save()
-        self.perform_managed_resource_destroy(resource, force=resource.state == models.Resource.States.ERRED)
-
-    destroy.method = 'DELETE'
-    destroy.destructive = True
 
 
 class BaseResourceExecutorViewSet(six.with_metaclass(ResourceViewMetaclass,
-                                                     StateExecutorViewSet,
-                                                     core_mixins.UserContextMixin,
+                                                     core_views.StateExecutorViewSet,
+                                                     ResourceViewMixin,
                                                      viewsets.ModelViewSet)):
-
-    queryset = NotImplemented
-    serializer_class = NotImplemented
-    lookup_field = 'uuid'
-    permission_classes = (rf_permissions.IsAuthenticated, rf_permissions.DjangoObjectPermissions)
-    filter_backends = (
-        filters.GenericRoleFilter,
-        core_filters.DjangoMappingFilterBackend,
-        SlaFilter,
-        MonitoringItemFilter,
-        filters.TagsFilter,
-    )
-    filter_class = filters.BaseResourceStateFilter
-    metadata_class = ResourceActionsMetadata
-    create_executor = NotImplemented
-    update_executor = NotImplemented
-    delete_executor = NotImplemented
+    filter_class = filters.BaseResourceFilter
 
 
 class BaseServicePropertyViewSet(viewsets.ReadOnlyModelViewSet):
@@ -2139,20 +1860,25 @@ class BaseResourcePropertyExecutorViewSet(core_mixins.CreateExecutorMixin,
     serializer_class = NotImplemented
     lookup_field = 'uuid'
     permission_classes = (rf_permissions.IsAuthenticated, rf_permissions.DjangoObjectPermissions)
-    filter_backends = (filters.GenericRoleFilter, rf_filters.DjangoFilterBackend)
+    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend)
 
 
 class VirtualMachineViewSet(core_mixins.RuntimeStateMixin, BaseResourceExecutorViewSet):
-    filter_class = filters.BaseResourceStateFilter
+    filter_class = filters.BaseResourceFilter
     runtime_state_executor = NotImplemented
-    acceptable_states = {'unlink': [core_models.StateMixin.States.OK]}
+    runtime_acceptable_states = {
+        'stop': core_models.RuntimeStateMixin.RuntimeStates.ONLINE,
+        'start': core_models.RuntimeStateMixin.RuntimeStates.OFFLINE,
+        'restart': core_models.RuntimeStateMixin.RuntimeStates.ONLINE,
+    }
 
     @detail_route(methods=['post'])
     def unlink(self, request, uuid=None):
-        # XXX: add special attribute to an instance in order to be tracked by signal handler
         instance = self.get_object()
-        setattr(instance, 'PERFORM_UNLINK', True)
+        instance.unlink()
         self.perform_destroy(instance)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    unlink.destructive = True
 
     @detail_route(methods=['post'])
     def start(self, request, uuid=None):
@@ -2163,7 +1889,7 @@ class VirtualMachineViewSet(core_mixins.RuntimeStateMixin, BaseResourceExecutorV
             final_state=instance.RuntimeStates.ONLINE,
             async=self.async_executor,
             updated_fields=None)
-        return Response({'detail': 'starting was scheduled'}, status=status.HTTP_202_ACCEPTED)
+        return Response({'detail': _('Starting was scheduled.')}, status=status.HTTP_202_ACCEPTED)
 
     @detail_route(methods=['post'])
     def stop(self, request, uuid=None):
@@ -2174,7 +1900,7 @@ class VirtualMachineViewSet(core_mixins.RuntimeStateMixin, BaseResourceExecutorV
             final_state=instance.RuntimeStates.OFFLINE,
             async=self.async_executor,
             updated_fields=None)
-        return Response({'detail': 'stopping was scheduled'}, status=status.HTTP_202_ACCEPTED)
+        return Response({'detail': _('Stopping was scheduled.')}, status=status.HTTP_202_ACCEPTED)
 
     @detail_route(methods=['post'])
     def restart(self, request, uuid=None):
@@ -2185,16 +1911,16 @@ class VirtualMachineViewSet(core_mixins.RuntimeStateMixin, BaseResourceExecutorV
             final_state=instance.RuntimeStates.ONLINE,
             async=self.async_executor,
             updated_fields=None)
-        return Response({'detail': 'restarting was scheduled'}, status=status.HTTP_202_ACCEPTED)
+        return Response({'detail': _('Restarting was scheduled.')}, status=status.HTTP_202_ACCEPTED)
 
 
 class AggregatedStatsView(views.APIView):
     """
-    Quotas and quotas usage aggregated by projects/project_groups/customers.
+    Quotas and quotas usage aggregated by projects/customers.
 
     Available request parameters:
         - ?aggregate=aggregate_model_name (default: 'customer'.
-          Have to be from list: 'customer', 'project', 'project_group')
+          Have to be from list: 'customer', 'project')
         - ?uuid=uuid_of_aggregate_model_object (not required. If this parameter will be defined -
           result will contain only object with given uuid)
         - ?quota_name - optional list of quota names, for example ram, vcpu, storage
@@ -2215,7 +1941,7 @@ class AggregatedStatsView(views.APIView):
 
 class QuotaTimelineStatsView(views.APIView):
     """
-    Historical data of quotas and quotas usage aggregated by projects/project_groups/customers.
+    Historical data of quotas and quotas usage aggregated by projects/customers.
 
     Available request parameters:
 
@@ -2223,7 +1949,7 @@ class QuotaTimelineStatsView(views.APIView):
     - ?to=timestamp (default: now, for example: 1415912625)
     - ?interval (default: day. Has to be from list: hour, day, week, month)
     - ?item=<quota_name>. If this parameter is not defined - endpoint will return data for all items.
-    - ?aggregate=aggregate_model_name (default: 'customer'. Have to be from list: 'customer', 'project', 'project_group')
+    - ?aggregate=aggregate_model_name (default: 'customer'. Have to be from list: 'customer', 'project')
     - ?uuid=uuid_of_aggregate_model_object (not required. If this parameter is defined, result will contain only object with given uuid)
 
     Answer will be list of dictionaries with fields, determining time frame. It's size is equal to interval parameter.
@@ -2269,7 +1995,7 @@ class QuotaTimelineStatsView(views.APIView):
 
     def get_all_spls_quotas(self):
         # XXX: quick and dirty hack for OpenStack: use tenants instead of SPLs as quotas scope.
-        spl_models = [m if m.__name__ != 'OpenStackServiceProjectLink' else m.tenants.related.related_model
+        spl_models = [m if m.__name__ != 'OpenStackServiceProjectLink' else m.tenants.model
                       for m in models.ServiceProjectLink.get_all_models()]
         return sum([spl_model.get_quotas_names() for spl_model in spl_models], [])
 
@@ -2361,3 +2087,29 @@ class QuotaTimelineCollector(object):
                 row['%s_usage' % item] = self.usages[key]
             table.append(row)
         return table
+
+
+class ResourceViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
+    """ Basic view set for all resource view sets. """
+    lookup_field = 'uuid'
+    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend, filters.StartTimeFilter)
+    metadata_class = ActionsMetadata
+    unsafe_methods_permissions = [permissions.is_administrator]
+    update_validators = partial_update_validators = [core_validators.StateValidator(models.NewResource.States.OK)]
+    destroy_validators = [core_validators.StateValidator(models.NewResource.States.OK, models.NewResource.States.ERRED)]
+
+    @detail_route(methods=['post'])
+    def pull(self, request, uuid=None):
+        self.pull_executor.execute(self.get_object())
+        return Response({'detail': _('Pull operation was successfully scheduled.')}, status=status.HTTP_202_ACCEPTED)
+
+    pull_executor = NotImplemented
+    pull_validators = [core_validators.StateValidator(models.NewResource.States.OK, models.NewResource.States.ERRED)]
+
+
+class ServiceCertificationViewSet(core_views.ActionsViewSet):
+    lookup_field = 'uuid'
+    metadata_class = ActionsMetadata
+    unsafe_methods_permissions = [permissions.is_staff]
+    serializer_class = serializers.ServiceCertificationSerializer
+    queryset = models.ServiceCertification.objects.all()

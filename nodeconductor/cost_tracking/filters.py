@@ -1,5 +1,7 @@
 from __future__ import unicode_literals
 
+import uuid
+
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 import django_filters
@@ -8,16 +10,6 @@ from rest_framework import filters
 from nodeconductor.core import filters as core_filters
 from nodeconductor.cost_tracking import models, serializers
 from nodeconductor.structure import models as structure_models, SupportedServices
-
-
-class PriceEstimateFilter(django_filters.FilterSet):
-    is_manually_input = django_filters.BooleanFilter()
-
-    class Meta:
-        model = models.PriceEstimate
-        fields = [
-            'is_manually_input',
-        ]
 
 
 class PriceEstimateScopeFilterBackend(core_filters.GenericKeyFilterBackend):
@@ -29,7 +21,7 @@ class PriceEstimateScopeFilterBackend(core_filters.GenericKeyFilterBackend):
         return 'scope'
 
 
-class AdditionalPriceEstimateFilterBackend(filters.BaseFilterBackend):
+class PriceEstimateDateFilterBackend(filters.BaseFilterBackend):
 
     def filter_queryset(self, request, queryset, view):
         if 'date' in request.query_params:
@@ -51,24 +43,31 @@ class AdditionalPriceEstimateFilterBackend(filters.BaseFilterBackend):
             year, month = date_range_serializer.validated_data['end']
             queryset = queryset.filter(Q(year__lt=year) | Q(year=year, month__lte=month))
 
-        # Filter by customer
-        if 'customer' in request.query_params:
-            customer_uuid = request.query_params['customer']
-            qs = Q()
-            for model in models.PriceEstimate.get_estimated_models():
-                content_type = ContentType.objects.get_for_model(model)
-                if model == structure_models.Customer:
-                    query = {'uuid': customer_uuid}
-                else:
-                    query = {model.Permissions.customer_path + '__uuid': customer_uuid}
-                ids = model.objects.filter(**query).values_list('pk', flat=True)
-                qs |= Q(content_type=content_type, object_id__in=ids)
-
-            qs |= Q(scope_customer__uuid=customer_uuid)
-
-            queryset = queryset.filter(qs)
-
         return queryset
+
+
+class PriceEstimateCustomerFilterBackend(filters.BaseFilterBackend):
+    def filter_queryset(self, request, queryset, view):
+        if 'customer' not in request.query_params:
+            return queryset
+
+        customer_uuid = request.query_params['customer']
+        try:
+            uuid.UUID(customer_uuid)
+        except ValueError:
+            return queryset.none()
+
+        try:
+            customer = structure_models.Customer.objects.get(uuid=customer_uuid)
+        except structure_models.Customer.DoesNotExist:
+            return queryset.none()
+
+        ids = []
+        for estimate in models.PriceEstimate.objects.filter(scope=customer):
+            ids.append(estimate.pk)
+            for child in estimate.collect_children():
+                ids.append(child.pk)
+        return queryset.filter(pk__in=ids)
 
 
 class PriceListItemServiceFilterBackend(core_filters.GenericKeyFilterBackend):

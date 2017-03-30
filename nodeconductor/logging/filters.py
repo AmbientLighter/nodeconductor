@@ -1,24 +1,18 @@
 from __future__ import unicode_literals
 
-import re
-
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
+from django.utils.translation import ugettext_lazy as _
 import django_filters
 from rest_framework import settings, filters
 from rest_framework.serializers import ValidationError
 
 from nodeconductor.core import serializers as core_serializers, filters as core_filters
 from nodeconductor.core.filters import ExternalFilterBackend
+from nodeconductor.core.utils import camel_case_to_underscore
 from nodeconductor.logging import models, utils
 from nodeconductor.logging.elasticsearch_client import EmptyQueryset
 from nodeconductor.logging.loggers import event_logger, expand_event_groups, expand_alert_groups
-
-
-def _convert(name):
-    """ Converts CamelCase to underscore """
-    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
 
 
 class EventFilterBackend(filters.BaseFilterBackend):
@@ -31,9 +25,10 @@ class EventFilterBackend(filters.BaseFilterBackend):
 
         - ?event_type=<string> - type of filtered events. Can be list
         - ?search=<string> - text for FTS. FTS fields: 'message', 'customer_abbreviation', 'importance'
-          'project_group_name', 'cloud_account_name', 'project_name', 'user_full_name', 'user_native_name'
+          'project_name', 'user_full_name', 'user_native_name'
         - ?scope=<URL> - url of object that is connected to event
         - ?scope_type=<string> - name of scope type of object that is connected to event
+        - ?feature=<feature> (can be list) - include all event with type that belong to given features
         - ?exclude_features=<feature> (can be list) - exclude event from output if
           it's type corresponds to one of listed features
         - ?user_username=<string> - user's username
@@ -48,6 +43,9 @@ class EventFilterBackend(filters.BaseFilterBackend):
         should_terms = {}
         if 'event_type' in request.query_params:
             must_terms['event_type'] = request.query_params.getlist('event_type')
+        if 'feature' in request.query_params:
+            features = request.query_params.getlist('feature')
+            must_terms['event_type'] = expand_event_groups(features)
 
         # Group events by features in order to prevent large HTTP GET request
         if 'exclude_features' in request.query_params:
@@ -64,19 +62,31 @@ class EventFilterBackend(filters.BaseFilterBackend):
             field = core_serializers.GenericRelatedField(related_models=utils.get_loggable_models())
             field._context = {'request': request}
             obj = field.to_internal_value(request.query_params['scope'])
+
+            # XXX: Ilja - disabling this hack and re-opening a ticket. Additional analysis is required for
+            # a proper resolution
+            # # XXX: hack to prevent leaking customer events
+            # permitted_uuids = [uuid.hex for uuids in
+            #                    obj.get_permitted_objects_uuids(request.user).values() for uuid in uuids]
+            # if obj.uuid.hex not in permitted_uuids:
+            #     raise ValidationError('You do not have permission to view events for scope %s'
+            #                           % request.query_params['scope'])
+
             for key, val in obj.filter_by_logged_object().items():
                 # Use "{field_name}.raw" to get the non-analyzed version of the value
                 # https://github.com/elastic/kibana/issues/364
-                must_terms[_convert(key) + '.raw'] = [val]
+                must_terms[camel_case_to_underscore(key) + '.raw'] = [val]
+
         elif 'scope_type' in request.query_params:
-            choices = {str(m._meta): m for m in utils.get_loggable_models()}
+            choices = utils.get_scope_types_mapping()
             try:
                 scope_type = choices[request.query_params['scope_type']]
             except KeyError:
                 raise ValidationError(
-                    'Scope type "{}" is not valid. Has to be one from list: {}'.format(
-                        request.query_params['scope_type'], ', '.join(choices.keys()))
-                )
+                    _('Scope type "%(value)s" is not valid. Has to be one from list: %(items)s.') % dict(
+                        value=request.query_params['scope_type'],
+                        items=', '.join(choices.keys())
+                    ))
             else:
                 permitted_items = scope_type.get_permitted_objects_uuids(request.user).items()
                 if not permitted_items:
@@ -119,6 +129,8 @@ class AlertFilter(django_filters.FilterSet):
     content_type = core_filters.ContentTypeFilter()
     message = django_filters.CharFilter(lookup_type='icontains')
 
+    o = django_filters.OrderingFilter(fields=('severity', 'created'))
+
     class Meta:
         model = models.Alert
         fields = [
@@ -129,12 +141,6 @@ class AlertFilter(django_filters.FilterSet):
             'created_to',
             'content_type',
             'message'
-        ]
-        order_by = [
-            'severity',
-            '-severity',
-            'created',
-            '-created',
         ]
 
 
@@ -183,14 +189,15 @@ class AdditionalAlertFilterBackend(filters.BaseFilterBackend):
 
         # XXX: this filter is wrong and deprecated, need to be removed after replacement in Portal
         if 'scope_type' in request.query_params:
-            choices = {_convert(m.__name__): m for m in utils.get_loggable_models()}
+            choices = {camel_case_to_underscore(m.__name__): m for m in utils.get_loggable_models()}
             try:
                 scope_type = choices[request.query_params['scope_type']]
             except KeyError:
                 raise ValidationError(
-                    'Scope type "{}" is not valid. Has to be one from list: {}'.format(
-                        request.query_params['scope_type'], ', '.join(choices.keys()))
-                )
+                    _('Scope type "%(value)s" is not valid. Has to be one from list: %(items)s.') % dict(
+                        value=request.query_params['scope_type'],
+                        items=', '.join(choices.keys())
+                    ))
             else:
                 ct = ContentType.objects.get_for_model(scope_type)
                 queryset = queryset.filter(content_type=ct)
@@ -210,15 +217,31 @@ class ExternalAlertFilterBackend(ExternalFilterBackend):
     pass
 
 
-class PushHookFilter(django_filters.FilterSet):
-    author_uuid = django_filters.CharFilter(name='user__uuid')
+class BaseHookFilter(django_filters.FilterSet):
+    author_uuid = django_filters.UUIDFilter(name='user__uuid')
+    is_active = django_filters.BooleanFilter()
+    last_published = django_filters.DateTimeFilter()
+
+
+class WebHookFilter(BaseHookFilter):
+    class Meta(object):
+        model = models.WebHook
+
+
+class EmailHookFilter(BaseHookFilter):
+    class Meta(object):
+        model = models.EmailHook
+
+
+class HookSummaryFilterBackend(core_filters.SummaryFilter):
+
+    def get_base_filter(self):
+        return BaseHookFilter
+
+
+class PushHookFilter(BaseHookFilter):
     device_id = django_filters.CharFilter()
     token = django_filters.CharFilter()
 
     class Meta(object):
         model = models.PushHook
-        fields = [
-            'author_uuid',
-            'device_id',
-            'token',
-        ]

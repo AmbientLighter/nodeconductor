@@ -3,10 +3,9 @@ from __future__ import unicode_literals
 from rest_framework import permissions as rf_permissions, exceptions as rf_exceptions, decorators, response, status
 from rest_framework import mixins
 from rest_framework import viewsets
-import reversion
+from reversion import revisions as reversion
 from reversion.models import Version
 
-from nodeconductor.core.filters import DjangoMappingFilterBackend
 from nodeconductor.core.pagination import UnlimitedLinkHeaderPagination
 from nodeconductor.core.serializers import HistorySerializer
 from nodeconductor.core.utils import datetime_to_timestamp
@@ -21,7 +20,6 @@ class QuotaViewSet(mixins.UpdateModelMixin,
     permission_classes = (rf_permissions.IsAuthenticated,)
     # XXX: Remove a custom pagination class once the quota calculation has been made more efficient
     pagination_class = UnlimitedLinkHeaderPagination
-    filter_backends = (DjangoMappingFilterBackend, )
     filter_class = filters.QuotaFilterSet
 
     def get_queryset(self):
@@ -75,7 +73,7 @@ class QuotaViewSet(mixins.UpdateModelMixin,
 
     def perform_update(self, serializer):
         if not serializer.instance.scope.can_user_update_quotas(self.request.user):
-            raise rf_exceptions.PermissionDenied('You do not have permission to perform this action.')
+            raise rf_exceptions.PermissionDenied()
         quota = self.get_object()
         quota_field = quota.get_field()
         # old style quotas do not have quota_field

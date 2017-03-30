@@ -1,15 +1,18 @@
 import calendar
+import datetime
 import importlib
+import re
+
+import os
 import requests
 import time
 
 from collections import OrderedDict
-from datetime import datetime
-from datetime import timedelta
 from operator import itemgetter
 
 from django.apps import apps
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.core.urlresolvers import reverse, resolve
 from django.http import QueryDict
 from django.utils import timezone
@@ -35,14 +38,14 @@ def format_time_and_value_to_segment_list(time_and_value_list, segments_count, s
     Format time_and_value_list to time segments
 
     Parameters
-    ----------
+    ^^^^^^^^^^
     time_and_value_list: list of tuples
         Have to be sorted by time
         Example: [(time, value), (time, value) ...]
     segments_count: integer
         How many segments will be in result
     Returns
-    -------
+    ^^^^^^^
     List of dictionaries
         Example:
         [{'from': time1, 'to': time2, 'value': sum_of_values_from_time1_to_time2}, ...]
@@ -72,18 +75,18 @@ def datetime_to_timestamp(datetime):
 
 
 def timestamp_to_datetime(timestamp, replace_tz=True):
-    dt = datetime.fromtimestamp(int(timestamp))
+    dt = datetime.datetime.fromtimestamp(int(timestamp))
     if replace_tz:
         dt = dt.replace(tzinfo=timezone.get_current_timezone())
     return dt
 
 
 def timeshift(**kwargs):
-    return timezone.now().replace(microsecond=0) + timedelta(**kwargs)
+    return timezone.now().replace(microsecond=0) + datetime.timedelta(**kwargs)
 
 
 def hours_in_month(month=None, year=None):
-    now = datetime.now()
+    now = datetime.datetime.now()
     if not month:
         month = now.month
     if not year:
@@ -91,6 +94,17 @@ def hours_in_month(month=None, year=None):
 
     days_in_month = calendar.monthrange(year, month)[1]
     return 24 * days_in_month
+
+
+def month_start(date):
+    return timezone.make_aware(datetime.datetime(day=1, month=date.month, year=date.year))
+
+
+def month_end(date):
+    days_in_month = calendar.monthrange(date.year, date.month)[1]
+    last_day_of_month = datetime.date(month=date.month, year=date.year, day=days_in_month)
+    last_second_of_month = datetime.datetime.combine(last_day_of_month, datetime.time.max)
+    return timezone.make_aware(last_second_of_month, timezone.get_current_timezone())
 
 
 def request_api(request, url_or_view_name, method='GET', data=None, params=None, verify=False):
@@ -111,7 +125,7 @@ def request_api(request, url_or_view_name, method='GET', data=None, params=None,
     return response
 
 
-def pwgen(pw_len=8):
+def pwgen(pw_len=16):
     """ Generate a random password with the given length.
         Allowed chars does not have "I" or "O" or letters and
         digits that look similar -- just to avoid confusion.
@@ -176,7 +190,26 @@ def instance_from_url(url, user=None):
     return queryset.get(**match.kwargs)
 
 
+def get_detail_view_name(model):
+    if model is NotImplemented:
+        raise AttributeError('Cannot get detail view name for not implemented model')
+
+    if hasattr(model, 'get_url_name') and callable(model.get_url_name):
+        return '%s-detail' % model.get_url_name()
+
+    return '%s-detail' % model.__name__.lower()
+
+
 def get_fake_context():
     user = get_user_model()()
     request = type('R', (object,), {'method': 'GET', 'user': user, 'query_params': QueryDict()})
     return {'request': request, 'user': user}
+
+
+def camel_case_to_underscore(name):
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+
+def silent_call(name, *args, **options):
+    call_command(name, stdout=open(os.devnull, 'w'), *args, **options)

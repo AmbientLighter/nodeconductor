@@ -1,4 +1,5 @@
 from django.db import IntegrityError
+from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers
 
 from nodeconductor.core.serializers import GenericRelatedField
@@ -27,7 +28,7 @@ class AlertSerializer(serializers.HyperlinkedModelSerializer):
 
     def create(self, validated_data):
         try:
-            alert, _ = loggers.AlertLogger().process(
+            alert, created = loggers.AlertLogger().process(
                 severity=validated_data['severity'],
                 message_template=validated_data['message'],
                 scope=validated_data['scope'],
@@ -36,7 +37,7 @@ class AlertSerializer(serializers.HyperlinkedModelSerializer):
         except IntegrityError:
             # In case of simultaneous requests serializer validation can pass for both alerts,
             # so we need to handle DB IntegrityError separately.
-            raise serializers.ValidationError('Alert with given type and scope already exists.')
+            raise serializers.ValidationError(_('Alert with given type and scope already exists.'))
         else:
             return alert
 
@@ -48,8 +49,6 @@ class EventSerializer(serializers.Serializer):
 
 
 class BaseHookSerializer(serializers.HyperlinkedModelSerializer):
-    event_types = serializers.MultipleChoiceField(choices=loggers.get_valid_events(), required=False)
-    event_groups = serializers.MultipleChoiceField(choices=loggers.get_event_groups_keys(), required=False)
     author_uuid = serializers.ReadOnlyField(source='user.uuid')
     hook_type = serializers.SerializerMethodField()
 
@@ -66,19 +65,37 @@ class BaseHookSerializer(serializers.HyperlinkedModelSerializer):
             'url': {'lookup_field': 'uuid'},
         }
 
+    def get_fields(self):
+        """
+        When static declaration is used, event type choices are fetched too early -
+        even before all apps are initialized. As a result, some event types are missing.
+        When dynamic declaration is used, all valid event types are available as choices.
+        """
+        fields = super(BaseHookSerializer, self).get_fields()
+        fields['event_types'] = serializers.MultipleChoiceField(
+            choices=loggers.get_valid_events(), required=False)
+        fields['event_groups'] = serializers.MultipleChoiceField(
+            choices=loggers.get_event_groups_keys(), required=False)
+        return fields
+
     def create(self, validated_data):
         validated_data['user'] = self.context['request'].user
         return super(BaseHookSerializer, self).create(validated_data)
 
     def validate(self, attrs):
-        if 'event_types' not in attrs and 'event_groups' not in attrs:
-            raise serializers.ValidationError('Please specify list of event_types or event_groups.')
+        if not self.instance and 'event_types' not in attrs and 'event_groups' not in attrs:
+            raise serializers.ValidationError(_('Please specify list of event_types or event_groups.'))
 
-        events = list(attrs.get('event_types', []))
-        groups = list(attrs.get('event_groups', []))
+        if 'event_groups' in attrs:
+            events = list(attrs.get('event_types', []))
+            groups = list(attrs.get('event_groups', []))
+            events = sorted(set(loggers.expand_event_groups(groups)) | set(events))
 
-        attrs['event_types'] = sorted(set(loggers.expand_event_groups(groups)) | set(events))
-        attrs['event_groups'] = groups
+            attrs['event_types'] = events
+            attrs['event_groups'] = groups
+
+        elif 'event_types' in attrs:
+            attrs['event_types'] = list(attrs['event_types'])
 
         return attrs
 

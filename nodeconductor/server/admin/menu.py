@@ -1,7 +1,29 @@
+import hashlib
+
+from admin_tools import utils
 from admin_tools.menu import items, Menu
+from django.core.cache import cache
 from django.core.urlresolvers import reverse
 from django.utils.text import capfirst
 from django.utils.translation import ugettext_lazy as _
+
+
+patched_filter_models = utils.filter_models
+
+
+def _filter_models(request, models, exclude):
+    key = request.user.uuid.hex + ''.join(models) + ''.join(exclude)
+    hashed_key = hashlib.sha256(key).hexdigest()
+    if hashed_key in cache:
+        result = cache.get(hashed_key)
+    else:
+        result = patched_filter_models(request, models, exclude)
+        cache.set(hashed_key, result, 60 * 60)
+
+    return result
+
+# This patch is required to decrease number of DB queries
+utils.filter_models = _filter_models
 
 
 class CustomAppList(items.AppList):
@@ -39,6 +61,8 @@ class CustomMenu(Menu):
     """
 
     IAAS_CLOUDS = (
+        'nodeconductor_assembly_waldur.packages.*',
+        'nodeconductor_assembly_waldur.invoices.*',
         'nodeconductor_azure.*',
         'nodeconductor_openstack.*',
         'nodeconductor_plus.aws.*',
@@ -50,7 +74,7 @@ class CustomMenu(Menu):
         'nodeconductor_saltstack.*',
         'nodeconductor_zabbix.*',
         'nodeconductor_jira.*',
-        'nodeconductor_plus.gitlab.*',
+        'nodeconductor_gitlab.*',
         'nodeconductor_oracle_dbaas.*',
         'nodeconductor_paas_oracle.*',
     )
@@ -77,6 +101,7 @@ class CustomMenu(Menu):
                 models=('nodeconductor.core.*',
                         'nodeconductor_organization.*',
                         'nodeconductor.structure.*',
+                        'nodeconductor_assembly_itacloud.template.*',  # Hack to show template groups in admin
                         )
             ),
             CustomAppList(

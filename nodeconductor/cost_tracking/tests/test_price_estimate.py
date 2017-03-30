@@ -15,7 +15,7 @@ class PriceEstimateListTest(BaseCostTrackingTest):
         super(PriceEstimateListTest, self).setUp()
 
         self.link_price_estimate = factories.PriceEstimateFactory(
-            year=2012, month=10, scope=self.service_project_link, is_manually_input=True)
+            year=2012, month=10, scope=self.service_project_link)
         self.project_price_estimate = factories.PriceEstimateFactory(scope=self.project, year=2015, month=7)
 
     @data('owner', 'manager', 'administrator')
@@ -60,8 +60,8 @@ class PriceEstimateListTest(BaseCostTrackingTest):
         self.client.force_authenticate(self.users['manager'])
         response = self.client.get(
             factories.PriceEstimateFactory.get_list_url(),
-            data={'start': '{}.{}'.format(self.link_price_estimate.year, self.link_price_estimate.month+1),
-                  'end': '{}.{}'.format(self.project_price_estimate.year, self.project_price_estimate.month+1)})
+            data={'start': '{}.{}'.format(self.link_price_estimate.year, self.link_price_estimate.month + 1),
+                  'end': '{}.{}'.format(self.project_price_estimate.year, self.project_price_estimate.month + 1)})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
@@ -75,61 +75,23 @@ class PriceEstimateListTest(BaseCostTrackingTest):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-
-@ddt
-class PriceEstimateCreateTest(BaseCostTrackingTest):
-
-    def setUp(self):
-        super(PriceEstimateCreateTest, self).setUp()
-
-        self.valid_data = {
-            'scope': structure_factories.TestServiceProjectLinkFactory.get_url(self.service_project_link),
-            'total': 100,
-            'details': {'ram': 50, 'disk': 50},
-            'month': 7,
-            'year': 2015,
-        }
-
-    @data('owner', 'staff')
-    def test_user_can_create_price_estimate(self, user):
-        self.client.force_authenticate(self.users[user])
-        response = self.client.post(factories.PriceEstimateFactory.get_list_url(), data=self.valid_data)
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(models.PriceEstimate.objects.filter(
-            scope=self.service_project_link,
-            is_manually_input=True,
-            month=self.valid_data['month'],
-            year=self.valid_data['year'],
-            is_visible=True).exists()
-        )
-
-    @data('manager', 'administrator')
-    def test_user_without_permissions_can_not_create_price_estimate(self, user):
-        self.client.force_authenticate(self.users[user])
-        response = self.client.post(factories.PriceEstimateFactory.get_list_url(), data=self.valid_data)
-
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-    @data('owner', 'staff', 'manager', 'administrator')
-    def test_user_cannot_create_price_estimate_for_project(self, user):
-        self.valid_data['scope'] = structure_factories.ProjectFactory.get_url(self.project)
-
-        self.client.force_authenticate(self.users[user])
-        response = self.client.post(factories.PriceEstimateFactory.get_list_url(), data=self.valid_data)
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_manually_inputed_price_estimate_replaces_autocalcuted(self):
-        price_estimate = factories.PriceEstimateFactory(
-            scope=self.service_project_link, month=self.valid_data['month'], year=self.valid_data['year'])
+    def test_user_can_define_children_visibility_depth(self):
+        customer_price_estimate = factories.PriceEstimateFactory(scope=self.customer, year=2015, month=7)
+        customer_price_estimate.children.add(self.project_price_estimate)
+        spl_price_estimate = factories.PriceEstimateFactory(scope=self.service_project_link, year=2015, month=7)
+        self.project_price_estimate.children.add(spl_price_estimate)
 
         self.client.force_authenticate(self.users['owner'])
-        response = self.client.post(factories.PriceEstimateFactory.get_list_url(), data=self.valid_data)
 
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        reread_price_estimate = models.PriceEstimate.objects.get(id=price_estimate.id)
-        self.assertFalse(reread_price_estimate.is_visible)
+        response = self.client.get(factories.PriceEstimateFactory.get_url(customer_price_estimate), data={'depth': 1})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # with visibility depth 1 we want to see customer estimate children
+        self.assertEqual(len(response.data['children']), 1)
+        project_estimate_data = response.data['children'][0]
+        self.assertEqual(project_estimate_data['uuid'], self.project_price_estimate.uuid.hex)
+        # with visibility depth 1 we do not want to see grandchildren
+        self.assertNotIn('children', project_estimate_data)
 
 
 class PriceEstimateUpdateTest(BaseCostTrackingTest):
@@ -163,20 +125,12 @@ class PriceEstimateUpdateTest(BaseCostTrackingTest):
         response = self.client.patch(factories.PriceEstimateFactory.get_url(self.price_estimate), data=self.valid_data)
 
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
-        reread_price_estimate = models.PriceEstimate.objects.get(id=self.price_estimate.id)
-        self.assertFalse(reread_price_estimate.is_manually_input)
 
 
 class PriceEstimateDeleteTest(BaseCostTrackingTest):
 
     def setUp(self):
         super(PriceEstimateDeleteTest, self).setUp()
-
-        self.manual_link_price_estimate = factories.PriceEstimateFactory(
-            scope=self.service_project_link, is_manually_input=True)
-        self.auto_link_price_estimate = factories.PriceEstimateFactory(
-            scope=self.service_project_link, is_manually_input=False,
-            month=self.manual_link_price_estimate.month, year=self.manual_link_price_estimate.year)
         self.project_price_estimate = factories.PriceEstimateFactory(scope=self.project)
 
     def test_autocreated_price_estimate_cannot_be_deleted(self):
@@ -185,25 +139,17 @@ class PriceEstimateDeleteTest(BaseCostTrackingTest):
 
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
-    def test_autocreated_price_estimate_become_visible_on_manual_estimate_deletion(self):
-        self.client.force_authenticate(self.users['staff'])
-        response = self.client.delete(factories.PriceEstimateFactory.get_url(self.manual_link_price_estimate))
-
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        reread_auto_link_price_estimate = models.PriceEstimate.objects.get(id=self.auto_link_price_estimate.id)
-        self.assertTrue(reread_auto_link_price_estimate.is_visible)
-
 
 class ScopeTypeFilterTest(BaseCostTrackingTest):
     def setUp(self):
         super(ScopeTypeFilterTest, self).setUp()
-        resource = structure_factories.TestInstanceFactory(service_project_link=self.service_project_link)
+        resource = structure_factories.TestNewInstanceFactory(service_project_link=self.service_project_link)
         self.estimates = {
-            'customer': factories.PriceEstimateFactory(scope=self.customer),
-            'service': factories.PriceEstimateFactory(scope=self.service),
-            'project': factories.PriceEstimateFactory(scope=self.project),
-            'service_project_link': factories.PriceEstimateFactory(scope=self.service_project_link),
-            'resource': factories.PriceEstimateFactory(scope=resource),
+            'customer': models.PriceEstimate.objects.get(scope=self.customer),
+            'service': models.PriceEstimate.objects.get(scope=self.service),
+            'project': models.PriceEstimate.objects.get(scope=self.project),
+            'service_project_link': models.PriceEstimate.objects.get(scope=self.service_project_link),
+            'resource': models.PriceEstimate.objects.get(scope=resource),
         }
 
     def test_user_can_filter_price_estimate_by_scope_type(self):
@@ -214,39 +160,33 @@ class ScopeTypeFilterTest(BaseCostTrackingTest):
                 data={'scope_type': scope_type})
 
             self.assertEqual(response.status_code, status.HTTP_200_OK)
-            self.assertEqual(len(response.data), 1)
+            self.assertEqual(len(response.data), 1, response.data)
             self.assertEqual(response.data[0]['uuid'], estimate.uuid.hex)
 
 
-@ddt
-class HistoricResourceTest(BaseCostTrackingTest):
+class CustomerFilterTest(BaseCostTrackingTest):
     def setUp(self):
-        super(HistoricResourceTest, self).setUp()
-        resource1 = structure_factories.TestInstanceFactory(service_project_link=self.service_project_link)
-        self.resource1_estimate = factories.PriceEstimateFactory(scope=resource1)
-        resource1.delete()
+        super(CustomerFilterTest, self).setUp()
+        resource = structure_factories.TestNewInstanceFactory()
+        link = resource.service_project_link
+        customer = link.customer
+        project = link.project
+        service = link.service
 
-        resource2 = structure_factories.TestInstanceFactory(service_project_link=self.service_project_link)
-        self.resource2_estimate = factories.PriceEstimateFactory(scope=resource2)
+        scopes = {link, customer, project, service, resource}
+        self.estimates = {models.PriceEstimate.objects.get(scope=scope) for scope in scopes}
+        self.customer = customer
 
-    @data('owner', 'staff')
-    def test_user_can_filter_price_estimates_by_customer(self, user):
-        self.client.force_authenticate(self.users[user])
-        response = self.client.get(factories.PriceEstimateFactory.get_list_url(),
-                                   {'customer': self.customer.uuid.hex})
+        resource2 = structure_factories.TestNewInstanceFactory()
+        resource2_estimate = factories.PriceEstimateFactory(scope=resource2)
+        resource2_estimate.create_ancestors()
+
+    def test_user_can_filter_price_estimate_by_customer_uuid(self):
+        self.client.force_authenticate(self.users['staff'])
+        response = self.client.get(
+            factories.PriceEstimateFactory.get_list_url(),
+            data={'customer': self.customer.uuid.hex})
+
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 2)
-
-    def test_user_can_not_see_historic_resources_for_other_customer(self):
-        self.client.force_authenticate(structure_factories.UserFactory())
-        response = self.client.get(factories.PriceEstimateFactory.get_list_url(),
-                                   {'customer': self.customer.uuid.hex})
-        self.assertEqual(len(response.data), 0)
-
-    def test_resource_exposes_scope_type_and_resource_type(self):
-        self.client.force_authenticate(self.users['owner'])
-        for estimate in (self.resource1_estimate, self.resource2_estimate):
-            response = self.client.get(factories.PriceEstimateFactory.get_url(estimate))
-            self.assertEqual(response.data['scope_name'], estimate.scope.name)
-            self.assertEqual(response.data['scope_type'], 'resource')
-            self.assertEqual(response.data['resource_type'], 'Test.TestInstance')
+        self.assertEqual({estimate['uuid'] for estimate in response.data},
+                         {estimate.uuid.hex for estimate in self.estimates})

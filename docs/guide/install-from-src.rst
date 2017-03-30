@@ -8,7 +8,7 @@ Additional requirements:
 - ``virtualenv``
 - C compiler and development libraries needed to build dependencies
 
-  - CentOS: ``gcc libffi-devel openssl-devel``
+  - CentOS: ``gcc libffi-devel openssl-devel python-devel``
   - Ubuntu: ``gcc libffi-dev libsasl2-dev libssl-dev python-dev``
 
 **NodeConductor installation**
@@ -52,9 +52,7 @@ Additional requirements:
 
     venv/bin/nodeconductor collectstatic --noinput
 
-7. In order to install SAML2_ based authentication you should also install ``nodeconductor-saml2`` plugin.
-
-8. Start NodeConductor:
+7. Start NodeConductor:
 
   .. code-block:: bash
 
@@ -156,6 +154,10 @@ Therefore configuration might look like this:
         NOTIFICATION_TITLE
            String to be displayed in the notification pop-up title.
 
+    SELLER_COUNTRY_CODE
+      Seller legal or effective country of registration or residence as an ISO 3166-1 alpha-2 country code.
+      It is used for computing VAT charge rate.
+
     SHOW_ALL_USERS
       Indicates whether user can see all other users in `api/users/` endpoint (boolean).
 
@@ -183,8 +185,8 @@ For example,
 See also: `Django database settings`_.
 
 .. _Django: https://www.djangoproject.com/
-.. _Django documentation: https://docs.djangoproject.com/en/1.6/
-.. _Django database settings: https://docs.djangoproject.com/en/1.7/ref/settings/#databases
+.. _Django documentation: https://docs.djangoproject.com/en/1.8/
+.. _Django database settings: https://docs.djangoproject.com/en/1.8/ref/settings/#databases
 .. _ICMP Types and Codes: http://en.wikipedia.org/wiki/Internet_Control_Message_Protocol#Control_messages
 .. _CIDR notation: http://en.wikipedia.org/wiki/Classless_Inter-Domain_Routing#CIDR_notation
 .. _SAML2: https://en.wikipedia.org/wiki/SAML_2.0

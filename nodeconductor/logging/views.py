@@ -2,13 +2,14 @@ from __future__ import unicode_literals
 
 from django.core.exceptions import PermissionDenied
 from django.db.models import Count
+from django.utils.translation import ugettext_lazy as _
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import response, viewsets, permissions, status, decorators, mixins
-from rest_framework import filters as rf_filters
 
 from nodeconductor.core import serializers as core_serializers, filters as core_filters, permissions as core_permissions
 from nodeconductor.core.managers import SummaryQuerySet
-from nodeconductor.logging import elasticsearch_client, models, serializers, filters, log, utils
-from nodeconductor.logging.loggers import get_event_groups, get_alert_groups
+from nodeconductor.logging import elasticsearch_client, models, serializers, filters, utils
+from nodeconductor.logging.loggers import get_event_groups, get_alert_groups, event_logger
 
 
 class EventViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
@@ -65,7 +66,7 @@ class EventViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
         scope = serializer.validated_data.get('scope')
         context = {'scope': scope} if scope is not None else {}
 
-        log.event_logger.custom.process(
+        event_logger.custom.process(
             level=serializer.validated_data.get('level'),
             message_template=serializer.validated_data.get('message'),
             event_type='custom_notification',
@@ -130,7 +131,7 @@ class EventViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
     @decorators.list_route()
     def scope_types(self, request, *args, **kwargs):
         """ Returns a list of scope types acceptable by events filter. """
-        return response.Response([str(m._meta) for m in utils.get_loggable_models()])
+        return response.Response(utils.get_scope_types_mapping().keys())
 
     @decorators.list_route()
     def event_groups(self, request, *args, **kwargs):
@@ -148,7 +149,7 @@ class AlertViewSet(mixins.CreateModelMixin,
     lookup_field = 'uuid'
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (
-        core_filters.DjangoMappingFilterBackend,
+        DjangoFilterBackend,
         filters.AdditionalAlertFilterBackend,
         filters.ExternalAlertFilterBackend,
         filters.AlertScopeFilterBackend,
@@ -180,7 +181,7 @@ class AlertViewSet(mixins.CreateModelMixin,
          - ?to=<timestamp> - filter alerts that was active to given date
          - ?opened - if this argument is in GET request endpoint will return only alerts that are not closed
          - ?closed - if this argument is in GET request endpoint will return only alerts that are closed
-         - ?aggregate=aggregate_model_name (default: 'customer'. Have to be from list: 'customer', project', 'project_group')
+         - ?aggregate=aggregate_model_name (default: 'customer'. Have to be from list: 'customer', project')
          - ?uuid=uuid_of_aggregate_model_object (not required. If this parameter will be defined - result ill contain only
            object with given uuid)
          - ?acknowledged=True|False - show only acknowledged (non-acknowledged) alerts
@@ -278,7 +279,7 @@ class AlertViewSet(mixins.CreateModelMixin,
             alert.acknowledge()
             return response.Response(status=status.HTTP_200_OK)
         else:
-            return response.Response({'detail': 'Alert is already acknowledged'}, status=status.HTTP_409_CONFLICT)
+            return response.Response({'detail': _('Alert is already acknowledged.')}, status=status.HTTP_409_CONFLICT)
 
     @decorators.detail_route(methods=['post'])
     def cancel_acknowledgment(self, request, *args, **kwargs):
@@ -292,7 +293,7 @@ class AlertViewSet(mixins.CreateModelMixin,
             alert.cancel_acknowledgment()
             return response.Response(status=status.HTTP_200_OK)
         else:
-            return response.Response({'detail': 'Alert is not acknowledged'}, status=status.HTTP_409_CONFLICT)
+            return response.Response({'detail': _('Alert is not acknowledged.')}, status=status.HTTP_409_CONFLICT)
 
     @decorators.list_route()
     def stats(self, request, *args, **kwargs):
@@ -326,7 +327,7 @@ class AlertViewSet(mixins.CreateModelMixin,
 
     def perform_create(self, serializer):
         if not self.request.user.is_staff:
-            raise PermissionDenied('You do not have permission to perform this action.')
+            raise PermissionDenied()
 
         super(AlertViewSet, self).perform_create(serializer)
 
@@ -345,12 +346,13 @@ class BaseHookViewSet(viewsets.ModelViewSet):
     To get a list of all your hooks, run **GET** against */api/hooks/* as an authenticated user.
     """
     permission_classes = (permissions.IsAuthenticated,)
-    filter_backends = (core_filters.StaffOrUserFilter, rf_filters.DjangoFilterBackend)
+    filter_backends = (core_filters.StaffOrUserFilter, DjangoFilterBackend)
     lookup_field = 'uuid'
 
 
 class WebHookViewSet(BaseHookViewSet):
     queryset = models.WebHook.objects.all()
+    filter_class = filters.WebHookFilter
     serializer_class = serializers.WebHookSerializer
 
     def create(self, request, *args, **kwargs):
@@ -403,6 +405,7 @@ class WebHookViewSet(BaseHookViewSet):
 
 class EmailHookViewSet(BaseHookViewSet):
     queryset = models.EmailHook.objects.all()
+    filter_class = filters.EmailHookFilter
     serializer_class = serializers.EmailHookSerializer
 
     def create(self, request, *args, **kwargs):
@@ -480,7 +483,7 @@ class HookSummary(mixins.ListModelMixin, viewsets.GenericViewSet):
     """
     serializer_class = serializers.SummaryHookSerializer
     permission_classes = (permissions.IsAuthenticated,)
-    filter_backends = (core_filters.StaffOrUserFilter, rf_filters.DjangoFilterBackend)
+    filter_backends = (core_filters.StaffOrUserFilter, filters.HookSummaryFilterBackend)
 
     def get_queryset(self):
         return SummaryQuerySet(models.BaseHook.get_all_models())

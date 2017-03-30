@@ -99,7 +99,7 @@ class ElasticsearchClient(object):
     class SearchBody(dict):
         FTS_FIELDS = (
             'message', 'customer_abbreviation', 'importance', 'project_group_name',
-            'cloud_account_name', 'project_name', 'user_native_name', 'user_full_name')
+            'project_name', 'user_native_name', 'user_full_name')
 
         def __init__(self):
             self.queries = {}
@@ -227,7 +227,7 @@ class ElasticsearchClient(object):
         Prepare body for elasticsearch query
 
         Search parameters
-        ----------
+        ^^^^^^^^^^^^^^^^^
         These parameters are dictionaries and have format:  <term>: [<value 1>, <value 2> ...]
         should_terms: it resembles logical OR
         must_terms: it resembles logical AND
@@ -294,7 +294,7 @@ class ElasticsearchClient(object):
             ca_certs=elasticsearch_settings.get('ca_certs', ''),
         )
         # XXX Workaround for Python Elasticsearch client bugs
-	if not elasticsearch_settings.get('verify_certs'):
+        if not elasticsearch_settings.get('verify_certs'):
             # Some parameters are handled incorrectly if verify_certs is false
             # Client's connection pool is the closes place we can fix this
             connection_pool = client.transport.get_connection().pool

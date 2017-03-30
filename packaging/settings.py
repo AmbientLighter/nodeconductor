@@ -9,6 +9,7 @@ from ConfigParser import RawConfigParser
 conf_dir = '/etc/nodeconductor'
 data_dir = '/usr/share/nodeconductor'
 work_dir = '/var/lib/nodeconductor'
+templates_dir = os.path.join(conf_dir, 'templates')
 
 config = RawConfigParser()
 config.read(os.path.join(conf_dir, 'settings.ini'))
@@ -16,8 +17,8 @@ config.read(os.path.join(conf_dir, 'settings.ini'))
 # If these sections and/or options are not set, these values are used as defaults
 config_defaults = {
     'global': {
-        'db_backend': 'sqlite3',
         'debug': 'false',
+        'default_from_email': '',
         'media_root': os.path.join(work_dir, 'media'),
         'owner_can_manage_customer': 'false',
         'secret_key': '',
@@ -27,14 +28,11 @@ config_defaults = {
     },
     'auth': {
         'token_lifetime': 3600,
-    },
-    'celery': {
-        'broker_url': 'redis://localhost',
-        'result_backend_url': 'redis://localhost',
+        'session_lifetime': 3600,
     },
     'elasticsearch': {
         # This location is RHEL7-specific, may be different on other platforms
-        'ca_certs': '/etc/pki/tls/certs/ca-bundle.crt',  # only has effect if veryfy_certs is true
+        'ca_certs': '/etc/pki/tls/certs/ca-bundle.crt',  # only has effect if verify_certs is true
         'host': '',
         'password': '',
         'port': '9200',
@@ -51,29 +49,27 @@ config_defaults = {
         'syslog': 'false',
     },
     'logging': {
+        'admin_email': '',  # empty to disable sending errors to admin by email
         'log_file': '',  # empty to disable logging to file
         'log_level': 'INFO',
         'syslog': 'false',
     },
-    'mysql': {
-        'host': 'localhost',
+    'postgresql': {
+        'host': '',  # empty to connect via local UNIX socket
         'name': 'nodeconductor',
         'password': 'nodeconductor',
-        'port': '3306',
+        'port': '5432',
         'user': 'nodeconductor',
     },
-    'openstack': {
-        'auth_url': '',
-        'cpu_overcommit_ratio': 1,
+    'redis': {
+        'host': 'localhost',
+        'port': '6379',
     },
     'rest_api': {
         'cors_allowed_domains': 'localhost,127.0.0.1',
     },
     'sentry': {
         'dsn': '',  # raven package is needed for this to work
-    },
-    'sqlite3': {
-        'path': os.path.join(work_dir, 'db.sqlite3'),
     },
 }
 
@@ -84,6 +80,18 @@ for section, options in config_defaults.items():
         if not config.has_option(section, option):
             config.set(section, option, value)
 
+redis_url = 'redis://%s:%s' % (config.get('redis', 'host'), config.get('redis', 'port'))
+
+# Handle deprecated settings
+for section in ('billing', 'celery', 'mysql', 'openstack', 'sqlite3'):
+    if config.has_section(section):
+        warnings.warn("'%s' section in settings.ini is no longer supported and will be ignored" % section)
+
+for option in ('db_backend', 'enable_order_processing'):
+    if config.has_option('global', option):
+        warnings.warn(
+            "'global.%s' property in settings.ini is no longer supported and will be ignored" % option)
+
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config.get('global', 'secret_key')
 
@@ -92,6 +100,9 @@ DEBUG = config.getboolean('global', 'debug')
 for tmpl in TEMPLATES:
     tmpl.setdefault('OPTIONS', {})
     tmpl['OPTIONS']['debug'] = config.getboolean('global', 'template_debug')
+
+# Allow to overwrite templates
+TEMPLATES[0]['DIRS'].insert(0, templates_dir)
 
 # For security reason disable browsable API rendering in production
 if not DEBUG:
@@ -106,70 +117,47 @@ ALLOWED_HOSTS = ['*']
 #
 
 # Database
-# See also: https://docs.djangoproject.com/en/1.7/ref/settings/#databases
-
+#
+# Requirements:
+#  - PostgreSQL server is running and accessible on 'HOST':'PORT'
+#  - PostgreSQL user 'USER' created and can access PostgreSQL server using password 'PASSWORD'
+#  - PostgreSQL database 'NAME' created with all privileges granted to user 'USER'
+#  - psycopg2 package is installed: https://pypi.python.org/pypi/psycopg2
+#
+# Note: if PostgreSQL server is running on local host and is accessible via UNIX socket,
+# leave 'HOST' and 'PORT' empty. For password usage details in this setup see
+# https://www.postgresql.org/docs/9.5/static/auth-methods.html
+#
+# Example: create database, user and grant privileges:
+#
+#   CREATE DATABASE nodeconductor ENCODING 'UTF8'
+#   CREATE USER nodeconductor WITH PASSWORD 'nodeconductor'
+#
+# Example: install psycopg2 in CentOS:
+#
+#   yum install python-psycopg2
+#
+# See also: https://docs.djangoproject.com/en/1.8/ref/settings/#databases
 DATABASES = {
-    # Requirements for MySQL ('HOST', 'NAME', 'USER' and 'PASSWORD' are configured below):
-    #  - MySQL server running and accessible on 'HOST':'PORT'
-    #  - User 'USER' created and can login to MySQL server using password 'PASSWORD'
-    #  - Database 'NAME' created with all privileges granted to user 'USER'
-    #  - MySQL-python installed: https://pypi.python.org/pypi/MySQL-python
-    #
-    # Example: create database, user and grant privileges:
-    #
-    #   CREATE DATABASE nodeconductor CHARACTER SET = utf8;
-    #   CREATE USER 'nodeconductor'@'%' IDENTIFIED BY 'nodeconductor';
-    #   GRANT ALL PRIVILEGES ON nodeconductor.* to 'nodeconductor'@'%';
-    #
-    # Example: install MySQL-python in CentOS:
-    #
-    #   yum install MySQL-python
-    #
-    'default': {}
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql_psycopg2',
+        'NAME': config.get('postgresql', 'name'),
+        'HOST': config.get('postgresql', 'host'),
+        'PORT': config.get('postgresql', 'port'),
+        'USER': config.get('postgresql', 'user'),
+        'PASSWORD': config.get('postgresql', 'password'),
+    },
 }
 
-for prop in ('password', 'username', 'tenant_name'):
-    if config.has_option('openstack', prop):
-        warnings.warn("openstack.%s property in settings.ini is no longer supported and will be ignored" % prop)
-
-if config.has_option('celery', 'recover_erred_cloud_memberships_period'):
-    warnings.warn(
-        "celery.recover_erred_cloud_memberships_period property in settings.ini is "
-        "no longer supported and will be ignored in favor of celery.recover_erred_services_period")
-
-if config.has_option('global', 'enable_order_processing'):
-    warnings.warn(
-        "global.enable_order_processing property in settings.ini is "
-        "no longer supported and will be ignored")
-
-if config.get('global', 'db_backend') == 'mysql':
-    DATABASES['default'] = {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': config.get('mysql', 'name'),
-        'HOST': config.get('mysql', 'host'),
-        'PORT': config.get('mysql', 'port'),
-        'USER': config.get('mysql', 'user'),
-        'PASSWORD': config.get('mysql', 'password'),
-    }
-elif config.has_section('sqlite3'):
-    DATABASES['default'] = {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': config.get('sqlite3', 'path'),
-    }
-
-if config.has_section('billing'):
-    warnings.warn(
-        "[billing] section in settings.ini is no longer supported and will be ignored")
-
 # Logging
-# See also: https://docs.djangoproject.com/en/1.7/ref/settings/#logging
+# See also: https://docs.djangoproject.com/en/1.8/ref/settings/#logging
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,  # fixes Celery beat logging
 
     # Filters
     # Filter provides additional control over which log records are passed from logger to handler.
-    # See also: https://docs.djangoproject.com/en/1.7/topics/logging/#filters
+    # See also: https://docs.djangoproject.com/en/1.8/topics/logging/#filters
     'filters': {
         # Filter out only events (user-facing messages)
         'is-event': {
@@ -179,11 +167,15 @@ LOGGING = {
         'is-not-event': {
             '()': 'nodeconductor.logging.log.RequireNotEvent',
         },
+        # Filter out messages from background tasks
+        'is-not-background-task': {
+            '()': 'nodeconductor.logging.log.RequireNotBackgroundTask',
+        },
     },
 
     # Formatters
     # Formatter describes the exact format of the log entry.
-    # See also: https://docs.djangoproject.com/en/1.7/topics/logging/#formatters
+    # See also: https://docs.djangoproject.com/en/1.8/topics/logging/#formatters
     'formatters': {
         'message-only': {
             'format': '%(message)s',
@@ -195,8 +187,15 @@ LOGGING = {
 
     # Handlers
     # Handler determines what happens to each message in a logger.
-    # See also: https://docs.djangoproject.com/en/1.7/topics/logging/#handlers
+    # See also: https://docs.djangoproject.com/en/1.8/topics/logging/#handlers
     'handlers': {
+        # Send logs to admins by email
+        # See also: https://docs.djangoproject.com/en/1.8/topics/logging/#django.utils.log.AdminEmailHandler
+        'email-admins': {
+            'filters': ['is-not-background-task'],
+            'class': 'django.utils.log.AdminEmailHandler',
+            'level': 'ERROR',
+        },
         # Write logs to file
         # See also: https://docs.python.org/2/library/logging.handlers.html#watchedfilehandler
         'file': {
@@ -225,31 +224,32 @@ LOGGING = {
             'class': 'logging.handlers.SysLogHandler',
             'filters': ['is-event'],
             'formatter': 'message-only',
-            'level': config.get('logging', 'log_level').upper(),
+            'level': config.get('events', 'log_level').upper(),
         },
         # Send logs to log server
         # Note that nodeconductor.logging.log.TCPEventHandler does not support exernal formatters
         'tcp': {
             'class': 'nodeconductor.logging.log.TCPEventHandler',
             'filters': ['is-not-event'],
-            'level': config.get('events', 'log_level').upper(),
+            'level': config.get('logging', 'log_level').upper(),
         },
         'tcp-event': {
             'class': 'nodeconductor.logging.log.TCPEventHandler',
             'filters': ['is-event'],
             'level': config.get('events', 'log_level').upper(),
         },
-        'hook': {
+        # Send logs to web hook
+        'hook-event': {
             'class': 'nodeconductor.logging.log.HookHandler',
             'filters': ['is-event'],
             'level': config.get('events', 'log_level').upper()
-        }
+        },
     },
 
     # Loggers
     # A logger is the entry point into the logging system.
     # Each logger is a named bucket to which messages can be written for processing.
-    # See also: https://docs.djangoproject.com/en/1.7/topics/logging/#loggers
+    # See also: https://docs.djangoproject.com/en/1.8/topics/logging/#loggers
     #
     # Default logger configuration
     'root': {
@@ -257,6 +257,10 @@ LOGGING = {
     },
     # Default configuration can be overridden on per-module basis
     'loggers': {
+        # Celery loggers
+        'celery.worker': {
+            'handlers': [],
+        },
         'django': {
             'handlers': [],
         },
@@ -271,6 +275,11 @@ LOGGING = {
     },
 }
 
+if config.get('logging', 'admin_email') != '':
+    ADMINS += (('Admin', config.get('logging', 'admin_email')),)
+    LOGGING['loggers']['celery.worker']['handlers'].append('email-admins')
+    LOGGING['loggers']['nodeconductor']['handlers'].append('email-admins')
+
 if config.get('logging', 'log_file') != '':
     LOGGING['handlers']['file']['filename'] = config.get('logging', 'log_file')
     LOGGING['loggers']['django']['handlers'].append('file')
@@ -280,6 +289,22 @@ if config.getboolean('logging', 'syslog'):
     LOGGING['handlers']['syslog']['address'] = '/dev/log'
     LOGGING['loggers']['django']['handlers'].append('syslog')
     LOGGING['loggers']['nodeconductor']['handlers'].append('syslog')
+
+if config.get('logging', 'log_level').upper() == 'DEBUG':
+    # Enabling debugging at http.client level (requests->urllib3->http.client)
+    # you will see the REQUEST, including HEADERS and DATA, and RESPONSE with HEADERS but without DATA.
+    # the only thing missing will be the response.body which is not logged.
+    try:  # for Python 3
+        from http.client import HTTPConnection
+    except ImportError:
+        from httplib import HTTPConnection
+    HTTPConnection.debuglevel = 1
+
+    LOGGING['loggers']['requests.packages.urllib3'] = {
+        'handlers': ['file'],
+        'level': 'DEBUG',
+        'propagate': True
+    }
 
 if config.get('events', 'log_file') != '':
     LOGGING['handlers']['file-event']['filename'] = config.get('events', 'log_file')
@@ -295,12 +320,20 @@ if config.getboolean('events', 'syslog'):
     LOGGING['loggers']['nodeconductor']['handlers'].append('syslog-event')
 
 if config.getboolean('events', 'hook'):
-    LOGGING['loggers']['nodeconductor']['handlers'].append('hook')
+    LOGGING['loggers']['nodeconductor']['handlers'].append('hook-event')
 
 # Static files
-# See also: https://docs.djangoproject.com/en/1.7/ref/settings/#static-files
-
+# See also: https://docs.djangoproject.com/en/1.8/ref/settings/#static-files
 STATIC_ROOT = config.get('global', 'static_root')
+
+# Django cache
+# https://docs.djangoproject.com/en/1.8/topics/cache/
+CACHES['default']['LOCATION'] = redis_url
+
+# Email
+# See also: https://docs.djangoproject.com/en/1.8/ref/settings/#default-from-email
+if config.get('global', 'default_from_email') != '':
+    DEFAULT_FROM_EMAIL = config.get('global', 'default_from_email')
 
 # Django CORS headers
 # See also: https://github.com/ottoyiu/django-cors-headers
@@ -324,239 +357,25 @@ MIDDLEWARE_CLASSES = (
     'django.middleware.common.CommonMiddleware',
 ) + MIDDLEWARE_CLASSES
 
-# Celery
-# See also: http://docs.celeryproject.org/en/latest/getting-started/brokers/index.html#broker-instructions
-# See also: http://docs.celeryproject.org/en/latest/configuration.html#broker-url
-BROKER_URL = config.get('celery', 'broker_url')
+# Session
+# https://docs.djangoproject.com/en/1.8/ref/settings/#sessions
+SESSION_COOKIE_AGE = config.getint('auth', 'session_lifetime')
 
-# See also: http://docs.celeryproject.org/en/latest/configuration.html#celery-result-backend
-CELERY_RESULT_BACKEND = config.get('celery', 'result_backend_url')
+# Celery
+# See also:
+#  - http://docs.celeryproject.org/en/latest/getting-started/brokers/index.html#broker-instructions
+#  - http://docs.celeryproject.org/en/latest/configuration.html#broker-url
+#  - http://docs.celeryproject.org/en/latest/configuration.html#celery-result-backend
+BROKER_URL = redis_url
+CELERY_RESULT_BACKEND = redis_url
 
 for app in INSTALLED_APPS:
     if app.startswith('nodeconductor_'):
         LOGGING['loggers'][app] = LOGGING['loggers']['nodeconductor']
 
 # NodeConductor internal configuration
-# See also: http://nodeconductor.readthedocs.org/en/stable/guide/intro.html#id1
+# See also: http://nodeconductor.readthedocs.io/en/stable/guide/intro.html#id1
 NODECONDUCTOR.update({
-    'DEFAULT_SECURITY_GROUPS': (
-        {
-            'name': 'icmp',
-            'description': 'Security group for ICMP',
-            'rules': (
-                {
-                    'protocol': 'icmp',
-                    'cidr': '0.0.0.0/0',
-                    'icmp_type': -1,
-                    'icmp_code': -1,
-                },
-            ),
-        },
-        {
-            'name': 'ssh',
-            'description': 'Security group for SSH',
-            'rules': (
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 22,
-                    'to_port': 22,
-                },
-            ),
-        },
-        {
-            'name': 'http',
-            'description': 'Security group for HTTP',
-            'rules': (
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 80,
-                    'to_port': 80,
-                },
-            ),
-        },
-        {
-            'name': 'https',
-            'description': 'Security group for HTTPS',
-            'rules': (
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 443,
-                    'to_port': 443,
-                },
-            ),
-        },
-        {
-            'name': 'rdp',
-            'description': 'Security group for RDP',
-            'rules': (
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 3389,
-                    'to_port': 3389,
-                },
-            ),
-        },
-        {
-            'name': 'postgresql',
-            'description': 'Security group for PostgreSQL PaaS service',
-            'rules': (
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 22,
-                    'to_port': 22,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 5432,
-                    'to_port': 5432,
-                },
-                {
-                    'protocol': 'icmp',
-                    'cidr': '0.0.0.0/0',
-                    'icmp_type': -1,
-                    'icmp_code': -1,
-                },
-            ),
-        },
-        {
-            'name': 'wordpress',
-            'description': 'Security group for WordPress PaaS service',
-            'rules': (
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 22,
-                    'to_port': 22,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 80,
-                    'to_port': 80,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 443,
-                    'to_port': 443,
-                },
-            ),
-        },
-        {
-            'name': 'zimbra',
-            'description': 'Security group for Zimbra PaaS service',
-            'rules': (
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 22,
-                    'to_port': 22,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 25,
-                    'to_port': 25,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 465,
-                    'to_port': 465,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 110,
-                    'to_port': 110,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 995,
-                    'to_port': 995,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 143,
-                    'to_port': 143,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 993,
-                    'to_port': 993,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 80,
-                    'to_port': 80,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 443,
-                    'to_port': 443,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 7071,
-                    'to_port': 7071,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 7025,
-                    'to_port': 7025,
-                },
-            ),
-        },
-        {
-            'name': 'zabbix',
-            'description': 'Security group for Zabbix advanced monitoring',
-            'rules': (
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 22,
-                    'to_port': 22,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 80,
-                    'to_port': 80,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 443,
-                    'to_port': 443,
-                },
-                {
-                    'protocol': 'tcp',
-                    'cidr': '0.0.0.0/0',
-                    'from_port': 3306,
-                    'to_port': 3306,
-                },
-            ),
-        },
-    ),
-    'OPENSTACK_OVERCOMMIT': (
-        {
-            'auth_url': config.get('openstack', 'auth_url'),
-            'cpu_overcommit_ratio': config.getint('openstack', 'cpu_overcommit_ratio'),
-        },
-    ),
     'ELASTICSEARCH': {
         'username': config.get('elasticsearch', 'username'),
         'password': config.get('elasticsearch', 'password'),
@@ -574,13 +393,29 @@ if NODECONDUCTOR['ELASTICSEARCH']['protocol'] == 'https':
     if NODECONDUCTOR['ELASTICSEARCH']['verify_certs']:
         NODECONDUCTOR['ELASTICSEARCH']['ca_certs'] = config.get('elasticsearch', 'ca_certs')
 
+# Swagger uses DRF session authentication which can be enabled in DEBUG mode
+if config.getboolean('global', 'debug'):
+    SWAGGER_SETTINGS['USE_SESSION_AUTH'] = True
+    SWAGGER_SETTINGS['LOGIN_URL'] = 'rest_framework:login'
+    SWAGGER_SETTINGS['LOGOUT_URL'] = 'rest_framework:logout'
+
 # Sentry integration
-# See also: http://raven.readthedocs.org/en/latest/integrations/django.html#setup
+# See also: https://docs.getsentry.com/hosted/clients/python/integrations/django/
 if config.get('sentry', 'dsn') != '':
     INSTALLED_APPS = INSTALLED_APPS + ('raven.contrib.django.raven_compat',)
+
     RAVEN_CONFIG = {
         'dsn': config.get('sentry', 'dsn'),
     }
+
+    # Send logs to Sentry
+    # See also: https://docs.getsentry.com/hosted/clients/python/integrations/django/#integration-with-logging
+    LOGGING['handlers']['sentry'] = {
+        'class': 'raven.contrib.django.raven_compat.handlers.SentryHandler',
+        'level': 'ERROR',
+    }
+    for logger in ['celery.worker', 'django', 'nodeconductor', 'requests']:
+        LOGGING['loggers'][logger]['handlers'].append('sentry')
 
 extensions = ('nodeconductor_plus.py', 'nodeconductor_saml2.py')
 for extension_name in extensions:

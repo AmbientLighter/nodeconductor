@@ -1,58 +1,64 @@
-import mock
-
+from ddt import ddt, data
 from django.test import TestCase
+from mock import patch, Mock
 
-from nodeconductor.structure import tasks as structure_tasks
-from nodeconductor.structure.tests import factories
-from nodeconductor.structure.utils import serialize_ssh_key, serialize_user
-
-
-@mock.patch('nodeconductor.structure.models.ServiceProjectLink.get_backend')
-class TestSshSynchronizationTask(TestCase):
-    def setUp(self):
-        self.link = factories.TestServiceProjectLinkFactory()
-        self.link_str = self.link.to_string()
-        self.ssh_key = factories.SshPublicKeyFactory()
-
-    def test_push_ssh_public_key_calls_backend(self, mock_backend):
-        structure_tasks.push_ssh_public_key(self.ssh_key.uuid.hex, self.link_str)
-        self.assertTrue(mock_backend().add_ssh_key.called)
-
-    def test_push_ssh_public_key_skips_if_link_is_gone(self, mock_backend):
-        self.link.delete()
-        self.assertFalse(mock_backend().add_ssh_key.called)
-
-    def test_remove_ssh_public_key_calls_backend(self, mock_backend):
-        structure_tasks.remove_ssh_public_key(serialize_ssh_key(self.ssh_key), self.link_str)
-        self.assertTrue(mock_backend().remove_ssh_key.called)
-
-    def test_remove_ssh_public_key_skips_if_link_is_gone(self, mock_backend):
-        self.link.delete()
-        structure_tasks.remove_ssh_public_key(serialize_ssh_key(self.ssh_key), self.link_str)
-        self.assertFalse(mock_backend().remove_ssh_key.called)
+from nodeconductor.core import utils
+from nodeconductor.structure import tasks
+from nodeconductor.structure.tests import factories, models
 
 
-@mock.patch('nodeconductor.structure.models.ServiceProjectLink.get_backend')
-class TestUserSynchronizationTask(TestCase):
-    def setUp(self):
-        self.link = factories.TestServiceProjectLinkFactory()
-        self.link_str = self.link.to_string()
-        self.user = factories.UserFactory()
+class TestDetectVMCoordinatesTask(TestCase):
 
-    def test_add_user_calls_backend(self, mock_backend):
-        structure_tasks.add_user(self.user.uuid.hex, self.link_str)
-        self.assertTrue(mock_backend().add_user.called)
+    @patch('requests.get')
+    def test_task_sets_coordinates(self, mock_request_get):
+        ip_address = "127.0.0.1"
+        expected_latitude = 20
+        expected_longitude = 20
+        instance = factories.TestNewInstanceFactory(external_ips=ip_address)
 
-    def test_add_user_skips_if_link_is_gone(self, mock_backend):
-        self.link.delete()
-        structure_tasks.add_user(self.user.uuid.hex, self.link_str)
-        self.assertFalse(mock_backend().add_user.called)
+        mock_request_get.return_value.ok = True
+        response = {"ip": ip_address, "latitude": expected_latitude, "longitude": expected_longitude}
+        mock_request_get.return_value.json.return_value = response
+        tasks.detect_vm_coordinates(utils.serialize_instance(instance))
 
-    def test_remove_user_calls_backend(self, mock_backend):
-        structure_tasks.remove_user(serialize_user(self.user), self.link_str)
-        self.assertTrue(mock_backend().remove_user.called)
+        instance.refresh_from_db()
+        self.assertEqual(instance.latitude, expected_latitude)
+        self.assertEqual(instance.longitude, expected_longitude)
 
-    def test_remove_user_skips_if_link_is_gone(self, mock_backend):
-        self.link.delete()
-        structure_tasks.remove_user(serialize_user(self.user), self.link_str)
-        self.assertFalse(mock_backend().remove_user.called)
+    @patch('requests.get')
+    def test_task_does_not_set_coordinates_if_response_is_not_ok(self, mock_request_get):
+        ip_address = "127.0.0.1"
+        instance = factories.TestNewInstanceFactory(external_ips=ip_address)
+
+        mock_request_get.return_value.ok = False
+        tasks.detect_vm_coordinates(utils.serialize_instance(instance))
+
+        instance.refresh_from_db()
+        self.assertIsNone(instance.latitude)
+        self.assertIsNone(instance.longitude)
+
+
+@ddt
+class ThrottleProvisionTaskTest(TestCase):
+
+    @data(
+        dict(size=tasks.ThrottleProvisionTask.DEFAULT_LIMIT + 1, retried=True),
+        dict(size=tasks.ThrottleProvisionTask.DEFAULT_LIMIT - 1, retried=False),
+    )
+    def test_if_limit_is_reached_provisioning_is_delayed(self, params):
+        link = factories.TestServiceProjectLinkFactory()
+        factories.TestNewInstanceFactory.create_batch(
+            size=params['size'],
+            state=models.TestNewInstance.States.CREATING,
+            service_project_link=link)
+        vm = factories.TestNewInstanceFactory(
+            state=models.TestNewInstance.States.CREATION_SCHEDULED,
+            service_project_link=link)
+        serialized_vm = utils.serialize_instance(vm)
+        mocked_retry = Mock()
+        tasks.ThrottleProvisionTask.retry = mocked_retry
+        tasks.ThrottleProvisionTask().si(
+            serialized_vm,
+            'create',
+            state_transition='begin_starting').apply()
+        self.assertEqual(mocked_retry.called, params['retried'])

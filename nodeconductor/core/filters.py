@@ -1,129 +1,18 @@
+import uuid
+
 import six
 from urlparse import urlparse
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.urlresolvers import resolve
 import django_filters
-from rest_framework import filters
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.filters import BaseFilterBackend
 
 from nodeconductor.core import serializers as core_serializers, fields as core_fields, models as core_models
 
 
-class DjangoMappingFilterBackend(filters.DjangoFilterBackend):
-    """ ..drfdocs-ignore
-
-        A filter backend that uses django-filter that fixes order_by.
-
-        This backend supports additional attribute of a FilterSet named `order_by_mapping`.
-        It maps ordering fields from user friendly ones to the ones that depend on
-        the model relation innards.
-
-        See https://github.com/alex/django-filter/issues/178#issuecomment-62129586
-
-        Example usage:
-
-        # models.py
-
-        class Project(models.Model):
-          name = models.CharField(max_length=10)
-
-
-        class Instance(models.Model):
-          name = models.CharField(max_length=10)
-          instance = models.ForeignKey(Project)
-
-        # filters.py
-
-        class InstanceFilter(django_filters.FilterSet):
-          class Meta(object):
-              model = models.Instance
-
-              # Filter fields go here
-              order_by = [
-                  'name',
-                  '-name',
-                  'project__name',
-                  '-project__name',
-              ]
-              order_by_mapping = {
-                  # Fix order by parameters
-                  'project_name': 'project__name',
-                  # '-project_name' mapping is handled automatically
-              }
-    """
-
-    def filter_queryset(self, request, queryset, view):
-        filter_class = self.get_filter_class(view, queryset)
-        if filter_class:
-            # XXX: The proper way would be to redefine FilterSetOptions,
-            # but it's too much of a boilerplate
-            mapping = getattr(filter_class.Meta, 'order_by_mapping', None)
-            order_by_field = getattr(filter_class, 'order_by_field')
-
-            if mapping:
-                transform = lambda o: self._transform_ordering(mapping, o)
-
-                params = request.query_params.copy()
-                ordering = map(transform, params.getlist(order_by_field))
-                params.setlist(order_by_field, ordering)
-            else:
-                params = request.query_params
-            return filter_class(params, queryset=queryset).qs
-        return queryset
-
-    # noinspection PyMethodMayBeStatic
-    def _transform_ordering(self, mapping, ordering):
-        if ordering.startswith('-'):
-            ordering = ordering[1:]
-            reverse = True
-        else:
-            reverse = False
-
-        try:
-            ordering = mapping[ordering]
-        except KeyError:
-            pass
-
-        if reverse:
-            return '-' + ordering
-
-        return ordering
-
-    def get_valid_ordering(self, request, filter_class):
-        """
-        Return valid ordering accepted by filter class or None.
-        """
-        order_by_field = getattr(filter_class, 'order_by_field', None)
-        if not order_by_field:
-            # Ordering is not accepted
-            return
-
-        ordering = request.query_params.get(order_by_field)
-        if not ordering:
-            # Ordering is not specified
-            return
-
-        if ordering not in self.get_ordering_choices(filter_class):
-            # Ordering is invalid
-            return
-
-        mapping = getattr(filter_class.Meta, 'order_by_mapping', None)
-        if not mapping:
-            return ordering
-
-        return self._transform_ordering(mapping, ordering)
-
-    def get_ordering_choices(self, filter_class):
-        """
-        Get all ordering choices accepted by filter class for validation.
-        """
-        order_by = getattr(filter_class.Meta, 'order_by', [])
-        order_by_mapping = getattr(filter_class.Meta, 'order_by_mapping', {})
-        order_by_mapping = {v: k for k, v in order_by_mapping.items()}
-        return [self._transform_ordering(order_by_mapping, ordering) for ordering in order_by]
-
-
-class GenericKeyFilterBackend(filters.DjangoFilterBackend):
+class GenericKeyFilterBackend(DjangoFilterBackend):
     """
     Backend for filtering by backend field.
 
@@ -270,17 +159,23 @@ class URLFilter(django_filters.CharFilter):
         self.lookup_field = lookup_field
 
     def get_uuid(self, value):
-        uuid = ''
+        uuid_value = ''
         path = urlparse(value).path
         if path.startswith('/'):
             match = resolve(path)
             if match.url_name == self.view_name:
-                uuid = match.kwargs.get(self.lookup_field)
-        return uuid
+                uuid_value = match.kwargs.get(self.lookup_field)
+        return uuid_value
 
     def filter(self, qs, value):
-        uuid = self.get_uuid(value)
-        return super(URLFilter, self).filter(qs, uuid)
+        if value:
+            uuid_value = self.get_uuid(value)
+            try:
+                uuid.UUID(uuid_value)
+            except ValueError:
+                return qs.none()
+            return super(URLFilter, self).filter(qs, uuid_value)
+        return qs
 
 
 class TimestampFilter(django_filters.NumberFilter):
@@ -313,10 +208,11 @@ class CategoryFilter(django_filters.CharFilter):
         return super(CategoryFilter, self).filter(qs, value)
 
 
-class StaffOrUserFilter(object):
+class StaffOrUserFilter(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
-        if request.user.is_staff:
+        if request.user.is_staff or request.user.is_support:
             return queryset
+
         return queryset.filter(user=request.user)
 
 
@@ -339,7 +235,7 @@ class BaseExternalFilter(object):
         raise NotImplementedError
 
 
-class ExternalFilterBackend(filters.BaseFilterBackend):
+class ExternalFilterBackend(BaseFilterBackend):
     """
     Support external filters registered in other apps
     """
@@ -360,3 +256,37 @@ class ExternalFilterBackend(filters.BaseFilterBackend):
         for filt in self.__class__.get_registered_filters():
             queryset = filt.filter(request, queryset, view)
         return queryset
+
+
+class SummaryFilter(DjangoFilterBackend):
+    """ Base filter for summary querysets """
+
+    def filter_queryset(self, request, queryset, view):
+        queryset = self.filter(request, queryset, view)
+        return queryset
+
+    def get_queryset_filter(self, queryset):
+        """ Return specific for queryset filter if it exists """
+        raise NotImplementedError()
+
+    def get_base_filter(self):
+        """ Return base filter that could be used for all summary objects """
+        raise NotImplementedError()
+
+    def _get_filter(self, queryset):
+        try:
+            return self.get_queryset_filter(queryset)
+        except NotImplementedError:
+            return self.get_base_filter()
+
+    def filter(self, request, queryset, view):
+        """ Filter each resource separately using its own filter """
+        summary_queryset = queryset
+        filtered_querysets = []
+        for queryset in summary_queryset.querysets:
+            filter_class = self._get_filter(queryset)
+            queryset = filter_class(request.query_params, queryset=queryset).qs
+            filtered_querysets.append(queryset)
+
+        summary_queryset.querysets = filtered_querysets
+        return summary_queryset

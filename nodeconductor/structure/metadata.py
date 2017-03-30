@@ -2,20 +2,23 @@ from collections import OrderedDict
 
 from django.utils.encoding import force_text
 from django.utils.http import urlencode
+from django.utils.translation import ugettext_lazy as _
 from rest_framework import exceptions
 from rest_framework.metadata import SimpleMetadata
+from rest_framework.request import clone_request
 from rest_framework.reverse import reverse
 
 from nodeconductor.core.exceptions import IncorrectStateException
-from nodeconductor.structure import SupportedServices
+from nodeconductor.core.utils import sort_dict
 
 
 class ActionSerializer(object):
-    def __init__(self, func, name, request, resource):
+    def __init__(self, func, name, request, view, resource):
         self.func = func
         self.name = name
         self.request = request
         self.resource = resource
+        self.view = view
 
     def serialize(self):
         reason = self.get_reason()
@@ -41,27 +44,33 @@ class ActionSerializer(object):
             return self.name.replace('_', ' ').title()
 
     def get_reason(self):
-        valid_state = None
-        if hasattr(self.func, 'valid_state'):
-            valid_state = getattr(self.func, 'valid_state')
-
-        try:
-            check_operation(self.request.user, self.resource, self.name, valid_state)
-        except exceptions.APIException as e:
-            return force_text(e)
+        if hasattr(self.view, 'check_operation'):
+            try:
+                self.view.check_operation(self.request, self.resource, self.name)
+            except exceptions.APIException as e:
+                return force_text(e)
+        else:
+            try:
+                self.view.initial(self.request)
+            except exceptions.APIException as e:
+                return force_text(e)
 
     def get_method(self):
         if self.name == 'destroy':
             return 'DELETE'
+        elif self.name == 'update':
+            return 'PUT'
         return getattr(self.func, 'method', 'POST')
 
     def get_url(self):
         base_url = self.request.build_absolute_uri()
         method = self.get_method()
-        return method == 'DELETE' and base_url or base_url + self.name + '/'
+        if method in ('DELETE', 'PUT'):
+            return base_url
+        return base_url + self.name + '/'
 
 
-class ResourceActionsMetadata(SimpleMetadata):
+class ActionsMetadata(SimpleMetadata):
     """
     Difference from SimpleMetadata class:
     1) Skip read-only fields, because options are used only for provisioning new resource.
@@ -83,11 +92,16 @@ class ResourceActionsMetadata(SimpleMetadata):
         such as start, stop, unlink
         """
         metadata = OrderedDict()
-        model = view.get_queryset().model
-        actions = SupportedServices.get_resource_actions(model)
+        actions = self.get_resource_actions(view)
+
         resource = view.get_object()
         for action_name, action in actions.items():
-            data = ActionSerializer(action, action_name, request, resource)
+            if action_name == 'update':
+                view.request = clone_request(request, 'PUT')
+            else:
+                view.action = action_name
+
+            data = ActionSerializer(action, action_name, request, view, resource)
             metadata[action_name] = data.serialize()
             if not metadata[action_name]['enabled']:
                 continue
@@ -97,18 +111,41 @@ class ResourceActionsMetadata(SimpleMetadata):
             else:
                 metadata[action_name]['type'] = 'form'
                 metadata[action_name]['fields'] = fields
+
+            view.action = None
+            view.request = request
+
         return metadata
+
+    @classmethod
+    def get_resource_actions(cls, view):
+        actions = {}
+        for key in dir(view.__class__):
+            callback = getattr(view.__class__, key)
+            if getattr(callback, 'deprecated', False):
+                continue
+            if 'post' not in getattr(callback, 'bind_to_methods', []):
+                continue
+            actions[key] = callback
+
+        disabled_actions = getattr(view.__class__, 'disabled_actions', [])
+
+        if 'DELETE' in view.allowed_methods and 'destroy' not in disabled_actions:
+            actions['destroy'] = view.destroy
+
+        if 'PUT' in view.allowed_methods and 'update' not in disabled_actions:
+            actions['update'] = view.update
+
+        return sort_dict(actions)
 
     def get_action_fields(self, view, action_name, resource):
         """
         Get fields exposed by action's serializer
         """
-        view.action = action_name
         serializer = view.get_serializer(resource)
         fields = OrderedDict()
-        if not isinstance(serializer, view.serializer_class):
+        if not isinstance(serializer, view.serializer_class) or action_name == 'update':
             fields = self.get_fields(serializer.fields)
-        view.action = None
         return fields
 
     def get_serializer_info(self, serializer):
@@ -143,9 +180,8 @@ class ResourceActionsMetadata(SimpleMetadata):
         field_info['required'] = getattr(field, 'required', False)
 
         attrs = [
-            'label', 'help_text',
-            'min_length', 'max_length',
-            'min_value', 'max_value', 'many'
+            'label', 'help_text', 'default_value', 'placeholder', 'required',
+            'min_length', 'max_length', 'min_value', 'max_value', 'many'
         ]
 
         if getattr(field, 'read_only', False):
@@ -186,15 +222,17 @@ def check_operation(user, resource, operation_name, valid_state=None):
     from nodeconductor.structure import models
 
     project = resource.service_project_link.project
-    is_admin = project.has_user(user, models.ProjectRole.ADMINISTRATOR) \
-        or project.customer.has_user(user, models.CustomerRole.OWNER)
+    has_access = user.is_staff or \
+                 project.customer.has_user(user, models.CustomerRole.OWNER) or \
+                 project.has_user(user, models.ProjectRole.ADMINISTRATOR) or \
+                 project.has_user(user, models.ProjectRole.MANAGER)
 
-    if not is_admin and not user.is_staff:
+    if not has_access:
         raise exceptions.PermissionDenied(
-            "Only project administrator or staff allowed to perform this action.")
+            _('Only project administrator or staff allowed to perform this action.'))
 
     if valid_state is not None:
         state = valid_state if isinstance(valid_state, (list, tuple)) else [valid_state]
         if state and resource.state not in state:
-            message = "Performing %s operation is not allowed for resource in its current state"
+            message = _('Performing %s operation is not allowed for resource in its current state.')
             raise IncorrectStateException(message % operation_name)

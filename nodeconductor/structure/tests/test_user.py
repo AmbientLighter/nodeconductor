@@ -2,6 +2,8 @@ from __future__ import unicode_literals
 
 import unittest
 
+from django.utils import timezone
+from freezegun import freeze_time
 from rest_framework import status
 from rest_framework import test
 
@@ -10,13 +12,15 @@ from nodeconductor.structure.models import CustomerRole
 from nodeconductor.structure.serializers import PasswordSerializer
 from nodeconductor.structure.tests import factories
 
+from . import fixtures
+
 
 class UserPermissionApiTest(test.APITransactionTestCase):
     def setUp(self):
         self.users = {
-            'staff': factories.UserFactory(is_staff=True),
-            'owner': factories.UserFactory(),
-            'not_owner': factories.UserFactory(),
+            'staff': factories.UserFactory(is_staff=True, agreement_date=timezone.now()),
+            'owner': factories.UserFactory(agreement_date=timezone.now()),
+            'not_owner': factories.UserFactory(agreement_date=timezone.now()),
         }
 
     # List filtration tests
@@ -35,6 +39,56 @@ class UserPermissionApiTest(test.APITransactionTestCase):
 
         response = self.client.get(factories.UserFactory.get_list_url())
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_staff_can_see_token_in_the_list(self):
+        self.client.force_authenticate(self.users['staff'])
+
+        response = self.client.get(factories.UserFactory.get_list_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), len(self.users))
+        self.assertIsNotNone(response.data[0]['token'])
+
+    def test_staff_can_see_token_and_its_lifetime_of_the_other_user(self):
+        self.client.force_authenticate(self.users['staff'])
+
+        response = self.client.get(factories.UserFactory.get_url(self.users['owner']))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.data['token'])
+        self.assertIn('token_lifetime', response.data)
+
+    def test_owner_cannot_see_token_and_its_lifetime_field_in_the_list_of_users(self):
+        self.client.force_authenticate(self.users['owner'])
+
+        response = self.client.get(factories.UserFactory.get_list_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+        self.assertIsNot('token', response.data[0])
+        self.assertIsNot('token_lifetime', response.data[0])
+
+    def test_owner_can_see_his_token_and_its_lifetime(self):
+        self.client.force_authenticate(self.users['owner'])
+
+        response = self.client.get(factories.UserFactory.get_url(self.users['owner']))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.data['token'])
+        self.assertIn('token_lifetime', response.data)
+
+    def test_owner_cannot_see_token_and_its_lifetime_of_the_other_user(self):
+        self.client.force_authenticate(self.users['owner'])
+
+        response = self.client.get(factories.UserFactory.get_url(self.users['not_owner']))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn('token', response.data)
+        self.assertNotIn('token_lifetime', response.data)
+
+    def test_user_can_see_his_token_via_current_filter(self):
+        self.client.force_authenticate(self.users['owner'])
+
+        response = self.client.get(factories.UserFactory.get_list_url(), {'current': True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(1, len(response.data))
+        self.assertIsNotNone('token', response.data[0])
+        self.assertIsNotNone('token_lifetime', response.data[0])
 
     # Creation tests
     def test_anonymous_user_cannot_create_account(self):
@@ -76,12 +130,16 @@ class UserPermissionApiTest(test.APITransactionTestCase):
 
     # Manipulation tests
     def test_user_can_change_his_account_email(self):
-        data = {'email': 'example@example.com'}
+        data = {
+            'email': 'example@example.com',
+        }
 
         self._ensure_user_can_change_field(self.users['owner'], 'email', data)
 
     def test_user_cannot_change_other_account_email(self):
-        data = {'email': 'example@example.com'}
+        data = {
+            'email': 'example@example.com',
+        }
 
         self._ensure_user_cannot_change_field(self.users['owner'], 'email', data)
 
@@ -101,16 +159,36 @@ class UserPermissionApiTest(test.APITransactionTestCase):
 
     @unittest.skip('Disabling as organization is temporary a read-only field.')
     def test_user_can_change_his_account_organization(self):
-        data = {'organization': 'test',
-                'email': 'example@example.com'}
+        data = {
+            'organization': 'test',
+            'email': 'example@example.com',
+        }
 
         self._ensure_user_can_change_field(self.users['owner'], 'organization', data)
 
     def test_user_cannot_change_other_account_organization(self):
-        data = {'organization': 'test',
-                'email': 'example@example.com'}
+        data = {
+            'organization': 'test',
+            'email': 'example@example.com',
+        }
 
         self._ensure_user_cannot_change_field(self.users['owner'], 'organization', data)
+
+    def test_user_can_change_his_token_lifetime(self):
+        data = {
+            'email': 'example@example.com',
+            'token_lifetime': 100,
+        }
+
+        self._ensure_user_can_change_field(self.users['owner'], 'token_lifetime', data)
+
+    def test_user_cannot_change_other_token_lifetime(self):
+        data = {
+            'email': 'example@example.com',
+            'token_lifetime': 100,
+        }
+
+        self._ensure_user_cannot_change_field(self.users['owner'], 'token_lifetime', data)
 
     def test_staff_user_can_change_any_accounts_fields(self):
         self.client.force_authenticate(user=self.users['staff'])
@@ -127,7 +205,7 @@ class UserPermissionApiTest(test.APITransactionTestCase):
 
         response = self.client.post(factories.UserFactory.get_password_url(self.users['owner']), data)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual('Password has been successfully updated', response.data['detail'])
+        self.assertEqual('Password has been successfully updated.', response.data['detail'])
 
         user = User.objects.get(uuid=self.users['owner'].uuid)
         self.assertTrue(user.check_password(data['password']))
@@ -262,7 +340,7 @@ class PasswordSerializerTest(unittest.TestCase):
             {'password': ['This field may not be blank.']}, serializer.errors)
 
 
-class UserFilterTest(test.APISimpleTestCase):
+class UserFilterTest(test.APITransactionTestCase):
 
     def test_user_list_can_be_filtered(self):
         supported_filters = [
@@ -530,3 +608,95 @@ class UserOrganizationApprovalApiTest(test.APITransactionTestCase):
         candidate_user = User.objects.get(username=self.users['user_with_request_to_a_customer'].username)
         self.assertTrue(candidate_user.organization == "")
         self.assertFalse(candidate_user.organization_approved, 'Organization is not approved')
+
+
+class CustomUsersFilterTest(test.APITransactionTestCase):
+
+    def setUp(self):
+        fixture = fixtures.ProjectFixture()
+        self.customer1 = fixture.customer
+        self.project1 = fixture.project
+        self.staff = fixture.staff
+        self.owner1 = fixture.owner
+        self.manager1 = fixture.manager
+
+        fixture2 = fixtures.ProjectFixture()
+        self.customer2 = fixture2.customer
+        self.project2 = fixture2.project
+        self.owner2 = fixture2.owner
+        self.manager2 = fixture2.manager
+
+        self.client.force_authenticate(self.staff)
+        self.url = factories.UserFactory.get_list_url()
+
+    def test_filter_user_by_customer(self):
+        response = self.client.get(self.url, {'customer_uuid': self.customer1.uuid.hex})
+        self.assertEquals(response.status_code, status.HTTP_200_OK)
+
+        actual = [user['uuid'] for user in response.data]
+        expected = [self.owner1.uuid.hex, self.manager1.uuid.hex]
+        self.assertEquals(actual, expected)
+
+    def test_filter_user_by_project(self):
+        response = self.client.get(self.url, {'project_uuid': self.project1.uuid.hex})
+        self.assertEquals(response.status_code, status.HTTP_200_OK)
+
+        actual = [user['uuid'] for user in response.data]
+        expected = [self.manager1.uuid.hex]
+        self.assertEquals(actual, expected)
+
+
+@freeze_time('2017-01-19 00:00:00')
+class UserUpdateTest(test.APITransactionTestCase):
+    def setUp(self):
+        fixture = fixtures.UserFixture()
+        self.user = fixture.user
+        self.client.force_authenticate(self.user)
+        self.url = factories.UserFactory.get_url(self.user)
+
+        self.invalid_payload = {
+            'email': 'updatedmail@example.com',
+        }
+        self.valid_payload = dict(agree_with_policy=True, **self.invalid_payload)
+
+    def test_if_user_did_not_accept_policy_he_can_not_update_his_profile(self):
+        response = self.client.put(self.url, self.invalid_payload)
+        self.assertEquals(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEquals(response.data['agree_with_policy'], ['User must agree with the policy.'])
+
+    def test_if_user_already_accepted_policy_he_can_update_his_profile(self):
+        self.user.agreement_date = timezone.now()
+        self.user.save()
+
+        response = self.client.put(self.url, self.invalid_payload)
+        self.assertEquals(response.status_code, status.HTTP_200_OK)
+
+    def test_if_user_accepts_policy_he_can_update_his_profile(self):
+        response = self.client.put(self.url, self.valid_payload)
+        self.assertEquals(response.status_code, status.HTTP_200_OK)
+
+        self.user.refresh_from_db()
+        self.assertEquals(self.user.email, self.valid_payload['email'])
+
+    def test_if_user_accepts_policy_agreement_data_is_updated(self):
+        response = self.client.put(self.url, self.valid_payload)
+        self.assertEquals(response.status_code, status.HTTP_200_OK)
+
+        self.user.refresh_from_db()
+        self.assertAlmostEqual(self.user.agreement_date, timezone.now())
+
+    def test_email_should_be_unique_and_error_should_be_specific_for_field(self):
+        email = self.invalid_payload['email']
+        factories.UserFactory(email=email)
+
+        response = self.client.put(self.url, self.valid_payload)
+
+        self.assertEquals(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEquals(response.data['email'], ['User with email "%s" already exists.' % email])
+
+    def test_token_lifetime_cannot_be_less_than_60_seconds(self):
+        self.valid_payload['token_lifetime'] = 59
+
+        response = self.client.put(self.url, self.valid_payload)
+        self.assertEquals(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('token_lifetime', response.data)

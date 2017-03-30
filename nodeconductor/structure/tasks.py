@@ -3,157 +3,36 @@ from __future__ import unicode_literals
 import logging
 
 from celery import shared_task
-from django.contrib.auth import get_user_model
+from django.core import exceptions
 from django.db import transaction
+from django.utils import six
 
-from nodeconductor.core import utils as core_utils
-from nodeconductor.core.tasks import retry_if_false, throttle, StateTransitionTask, ErrorMessageTask, Task
-from nodeconductor.core.models import SshPublicKey
-from nodeconductor.structure import (SupportedServices, ServiceBackendError,
-                                     ServiceBackendNotImplemented, models)
-from nodeconductor.structure.utils import deserialize_ssh_key, deserialize_user, GeoIpException
+from nodeconductor.core import utils as core_utils, tasks as core_tasks, models as core_models
+from nodeconductor.structure import SupportedServices, models, utils, ServiceBackendError
+
 
 logger = logging.getLogger(__name__)
 
 
-@shared_task(name='nodeconductor.structure.push_ssh_public_keys')
-def push_ssh_public_keys(service_project_links):
-    link_objects = models.ServiceProjectLink.from_string(service_project_links)
-    for link in link_objects:
-        str_link = link.to_string()
-
-        ssh_keys = SshPublicKey.objects.filter(user__groups__projectrole__project=link.project)
-        if not ssh_keys.exists():
-            logger.debug('There are no SSH public keys to push for link %s', str_link)
-            continue
-
-        for key in ssh_keys:
-            push_ssh_public_key.delay(key.uuid.hex, str_link)
-
-
-@shared_task(name='nodeconductor.structure.push_ssh_public_key', max_retries=120, default_retry_delay=30)
-@retry_if_false
-def push_ssh_public_key(ssh_public_key_uuid, service_project_link_str):
-    try:
-        public_key = SshPublicKey.objects.get(uuid=ssh_public_key_uuid)
-    except SshPublicKey.DoesNotExist:
-        logger.warning('Missing public key %s.', ssh_public_key_uuid)
-        return True
-    try:
-        service_project_link = next(models.ServiceProjectLink.from_string(service_project_link_str))
-    except StopIteration:
-        logger.warning('Missing service project link %s.', service_project_link_str)
-        return True
-
-    backend = service_project_link.get_backend()
-    try:
-        backend.add_ssh_key(public_key, service_project_link)
-        logger.info(
-            'SSH key %s has been pushed to service project link %s.',
-            public_key.uuid, service_project_link_str)
-    except ServiceBackendNotImplemented:
-        pass
-    except ServiceBackendError:
-        logger.warning(
-            'Failed to push SSH key %s to service project link %s.',
-            public_key.uuid, service_project_link_str,
-            exc_info=1)
-
-    return True
-
-
-@shared_task(name='nodeconductor.structure.remove_ssh_public_key')
-def remove_ssh_public_key(key_data, service_project_link_str):
-    public_key = deserialize_ssh_key(key_data)
-    try:
-        service_project_link = next(models.ServiceProjectLink.from_string(service_project_link_str))
-    except StopIteration:
-        logger.warning('Missing service project link %s.', service_project_link_str)
-        return True
-
-    try:
-        backend = service_project_link.get_backend()
-        backend.remove_ssh_key(public_key, service_project_link)
-        logger.info(
-            'SSH key %s has been removed from service project link %s.',
-            public_key.uuid, service_project_link_str)
-    except ServiceBackendNotImplemented:
-        pass
-    except ServiceBackendError:
-        logger.warning(
-            'Failed to remove SSH key %s from service project link %s.',
-            public_key.uuid, service_project_link_str,
-            exc_info=1)
-
-
-@shared_task(name='nodeconductor.structure.add_user', max_retries=120, default_retry_delay=30)
-@retry_if_false
-def add_user(user_uuid, service_project_link_str):
-    try:
-        user = get_user_model().objects.get(uuid=user_uuid)
-    except get_user_model().DoesNotExist:
-        logger.warning('Missing user %s.', user_uuid)
-        return True
-    try:
-        service_project_link = next(models.ServiceProjectLink.from_string(service_project_link_str))
-    except StopIteration:
-        logger.warning('Missing service project link %s.', service_project_link_str)
-        return True
-
-    backend = service_project_link.get_backend()
-    try:
-        backend.add_user(user, service_project_link)
-        logger.info(
-            'User %s has been added to service project link %s.',
-            user.uuid, service_project_link_str)
-    except ServiceBackendNotImplemented:
-        pass
-    except ServiceBackendError:
-        logger.warning(
-            'Failed to add user %s for service project link %s',
-            user.uuid, service_project_link_str,
-            exc_info=1)
-
-    return True
-
-
-@shared_task(name='nodeconductor.structure.remove_user')
-def remove_user(user_data, service_project_link_str):
-    user = deserialize_user(user_data)
-    try:
-        service_project_link = next(models.ServiceProjectLink.from_string(service_project_link_str))
-    except StopIteration:
-        logger.warning('Missing service project link %s.', service_project_link_str)
-        return True
-
-    try:
-        backend = service_project_link.get_backend()
-        backend.remove_user(user, service_project_link)
-        logger.info(
-            'User %s has been removed from service project link %s.',
-            user.uuid, service_project_link_str)
-    except ServiceBackendNotImplemented:
-        pass
-
-
 @shared_task(name='nodeconductor.structure.detect_vm_coordinates_batch')
-def detect_vm_coordinates_batch(virtual_machines):
-    for vm in models.ResourceMixin.from_string(virtual_machines):
-        detect_vm_coordinates.delay(vm.to_string())
+def detect_vm_coordinates_batch(serialized_virtual_machines):
+    for vm in serialized_virtual_machines:
+        detect_vm_coordinates.delay(vm)
 
 
 @shared_task(name='nodeconductor.structure.detect_vm_coordinates')
-def detect_vm_coordinates(vm_str):
+def detect_vm_coordinates(serialized_virtual_machine):
+
     try:
-        vm = next(models.ResourceMixin.from_string(vm_str))
-    except StopIteration:
-        logger.warning('Missing virtual machine %s.', vm_str)
+        vm = core_utils.deserialize_instance(serialized_virtual_machine)
+    except exceptions.ObjectDoesNotExist:
+        logger.warning('Missing virtual machine %s.', serialized_virtual_machine)
         return
 
     try:
         coordinates = vm.detect_coordinates()
-    except GeoIpException as e:
-        logger.warning('Unable to detect coordinates for virtual machines %s: %s.', vm_str, e)
+    except utils.GeoIpException as e:
+        logger.warning('Unable to detect coordinates for virtual machines %s: %s.', serialized_virtual_machine, e)
         return
 
     if coordinates:
@@ -162,7 +41,14 @@ def detect_vm_coordinates(vm_str):
         vm.save(update_fields=['latitude', 'longitude'])
 
 
-class ConnectSharedSettingsTask(Task):
+@shared_task(name='nodeconductor.structure.check_expired_permissions')
+def check_expired_permissions():
+    for cls in models.BasePermission.get_all_models():
+        for permission in cls.get_expired():
+            permission.revoke()
+
+
+class ConnectSharedSettingsTask(core_tasks.Task):
 
     def execute(self, service_settings):
         logger.debug('About to connect service settings "%s" to all available customers' % service_settings.name)
@@ -172,7 +58,7 @@ class ConnectSharedSettingsTask(Task):
 
         with transaction.atomic():
             for customer in models.Customer.objects.all():
-                defaults = {'name': service_settings.name, 'available_for_all': True}
+                defaults = {'available_for_all': True}
                 service, _ = service_model.objects.get_or_create(
                     customer=customer, settings=service_settings, defaults=defaults)
 
@@ -182,27 +68,132 @@ class ConnectSharedSettingsTask(Task):
         logger.info('Successfully connected service settings "%s" to all available customers' % service_settings.name)
 
 
-# CeleryBeat tasks
+class BackgroundPullTask(core_tasks.BackgroundTask):
+    """ Pull information about object from backend. Method "pull" should be implemented.
 
-@shared_task(name='nodeconductor.structure.pull_service_settings')
-def pull_service_settings():
-    for service_settings in models.ServiceSettings.objects.filter(state=models.ServiceSettings.States.OK):
-        serialized = core_utils.serialize_instance(service_settings)
-        sync_service_settings.delay(serialized)
-    for service_settings in models.ServiceSettings.objects.filter(state=models.ServiceSettings.States.ERRED):
-        serialized = core_utils.serialize_instance(service_settings)
-        sync_service_settings.apply_async(
-            args=(serialized,),
-            link=StateTransitionTask().si(serialized, state_transition='recover'),
-            link_error=ErrorMessageTask().s(serialized),
-        )
+        Task marks object as ERRED if pull failed and recovers it if pull succeed.
+    """
+
+    def run(self, serialized_instance):
+        instance = core_utils.deserialize_instance(serialized_instance)
+        try:
+            self.pull(instance)
+        except ServiceBackendError as e:
+            self.on_pull_fail(instance, e)
+        else:
+            self.on_pull_success(instance)
+
+    def is_equal(self, other_task, serialized_instance):
+        return self.name == other_task.get('name') and serialized_instance in other_task.get('args', [])
+
+    def pull(self, instance):
+        """ Pull instance from backend.
+
+            This method should not handle backend exception.
+        """
+        raise NotImplementedError('Pull task should implement pull method.')
+
+    def on_pull_fail(self, instance, error):
+        error_message = six.text_type(error)
+        self.log_error_message(instance, error_message)
+        self.set_instance_erred(instance, error_message)
+
+    def on_pull_success(self, instance):
+        if instance.state == instance.States.ERRED:
+            instance.recover()
+            instance.error_message = ''
+            instance.save(update_fields=['state', 'error_message'])
+
+    def log_error_message(self, instance, error_message):
+        logger_message = 'Failed to pull %s %s (PK: %s). Error: %s' % (
+            instance.__class__.__name__, instance.name, instance.pk, error_message)
+        if instance.state == instance.States.ERRED:  # report error on debug level if instance already was erred.
+            logger.debug(logger_message)
+        else:
+            logger.error(logger_message, exc_info=True)
+
+    def set_instance_erred(self, instance, error_message):
+        """ Mark instance as erred and save error message """
+        instance.set_erred()
+        instance.error_message = error_message
+        instance.save(update_fields=['state', 'error_message'])
 
 
-# Small work around to use @throttle decorator. Ideally we need to come with
-# solution how to use BackendMethodTask with @throttle.
-@shared_task
-@throttle(concurrency=2, key='service_settings_sync')
-def sync_service_settings(serialized_service_settings):
-    service_settings = core_utils.deserialize_instance(serialized_service_settings)
-    backend = service_settings.get_backend()
-    backend.sync()
+class BackgroundListPullTask(core_tasks.BackgroundTask):
+    """ Schedules pull task for each stable object of the model. """
+    model = NotImplemented
+    pull_task = NotImplemented
+
+    def is_equal(self, other_task):
+        return self.name == other_task.get('name')
+
+    def get_pulled_objects(self):
+        States = self.model.States
+        return self.model.objects.filter(state__in=[States.ERRED, States.OK]).exclude(backend_id='')
+
+    def run(self):
+        for instance in self.get_pulled_objects():
+            serialized = core_utils.serialize_instance(instance)
+            self.pull_task().delay(serialized)
+
+
+class ServiceSettingsBackgroundPullTask(BackgroundPullTask):
+
+    def pull(self, service_settings):
+        backend = service_settings.get_backend()
+        backend.sync()
+
+
+class ServiceSettingsListPullTask(BackgroundListPullTask):
+    name = 'nodeconductor.structure.ServiceSettingsListPullTask'
+    model = models.ServiceSettings
+    pull_task = ServiceSettingsBackgroundPullTask
+
+    def get_pulled_objects(self):
+        States = self.model.States
+        return self.model.objects.filter(state__in=[States.ERRED, States.OK])
+
+
+class RetryUntilAvailableTask(core_tasks.Task):
+    max_retries = 300
+    default_retry_delay = 5
+
+    def pre_execute(self, instance):
+        if not self.is_available(instance):
+            self.retry()
+        super(RetryUntilAvailableTask, self).pre_execute(instance)
+
+    def is_available(self, instance):
+        return True
+
+
+class BaseThrottleProvisionTask(RetryUntilAvailableTask):
+    """
+    Before starting resource provisioning, count how many resources
+    are already in "creating" state and delay provisioning if there are too many of them.
+    """
+    DEFAULT_LIMIT = 4
+
+    def is_available(self, resource):
+        usage = self.get_usage(resource)
+        limit = self.get_limit(resource)
+        return usage <= limit
+
+    def get_usage(self, resource):
+        service_settings = resource.service_project_link.service.settings
+        model_class = resource._meta.model
+        return model_class.objects.filter(
+            state=core_models.StateMixin.States.CREATING,
+            service_project_link__service__settings=service_settings).count()
+
+    def get_limit(self, resource):
+        return self.DEFAULT_LIMIT
+
+
+class ThrottleProvisionTask(BaseThrottleProvisionTask, core_tasks.BackendMethodTask):
+    pass
+
+
+class ThrottleProvisionStateTask(BaseThrottleProvisionTask, core_tasks.StateTransitionTask):
+    pass
+
